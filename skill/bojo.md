@@ -99,7 +99,6 @@ bojo toolchain list|install|remove <mojo|python> [version]
 bojo deps list|add|add-python    edit dependencies
 bojo repo-index <url>[@ref] [--follow]   read manifests over raw HTTP, emit JSONL
 bojo search <term> [--index <file>] [--json]
-bojo channel list|add <url>|remove <url>
 bojo cache list|clear            show / clear the project cache
 bojo allow <id>|--json|--list    approve or list hooks
 bojo clean [--all]               remove .bojo/ (--all: also .out/ and .vendor/)

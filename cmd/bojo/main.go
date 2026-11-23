@@ -99,8 +99,6 @@ func run(args []string) int {
 		return cmdRepoIndex(args[1:])
 	case "search":
 		return cmdSearch(args[1:])
-	case "channel":
-		return cmdChannel(args[1:])
 	case "validate":
 		return cmdValidate(args[1:])
 	case "test":
