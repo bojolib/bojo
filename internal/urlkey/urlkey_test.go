@@ -110,22 +110,42 @@ func TestHashIsStableAndTwelveHex(t *testing.T) {
 }
 
 func TestModulePath(t *testing.T) {
-	cases := []struct{ repo, pkg, want string }{
-		{"https://github.com/LukasLow/bojo_demo_pkg", "cprint", "github.com.LukasLow.bojo_demo_pkg.cprint"},
-		{"https://github.com/LukasLow/bojo_demo_pkg.git", "z", "github.com.LukasLow.bojo_demo_pkg.z"},
-		{"https://gitlab.com/a/b/c", "d", "gitlab.com.a.b.c.d"},
+	cases := []struct{ repo, want string }{
+		{"https://github.com/LukasLow/bojo_demo_pkg", "gh.LukasLow.bojo_demo_pkg"},
+		{"https://github.com/LukasLow/bojo_demo_pkg.git", "gh.LukasLow.bojo_demo_pkg"},
+		{"https://gitlab.com/a/b/c", "gl.a.b.c"},
+		{"https://codeberg.org/lukas/mojo-tls", "cb.lukas.mojo_tls"},
+		// An unknown host keeps its literal name: no invented abbreviation (D82).
+		{"https://git.example.com/someone/repo", "git.example.com.someone.repo"},
 	}
 	for _, c := range cases {
 		norm, err := Normalize(c.repo)
 		if err != nil {
 			t.Fatalf("%s: %v", c.repo, err)
 		}
-		got, err := ModulePath(norm, c.pkg)
+		got, err := ModulePath(norm)
 		if err != nil {
 			t.Fatalf("%s: %v", c.repo, err)
 		}
 		if got != c.want {
-			t.Errorf("ModulePath(%s, %s) = %q, want %q", c.repo, c.pkg, got, c.want)
+			t.Errorf("ModulePath(%s) = %q, want %q", c.repo, got, c.want)
+		}
+	}
+}
+
+func TestHostForPath(t *testing.T) {
+	cases := map[string]string{
+		"github.com":         "gh",
+		"GitHub.COM":         "gh",
+		"gitlab.com":         "gl",
+		"codeberg.org":       "cb",
+		"git.sr.ht":          "sr",
+		"git.example.com":    "git.example.com",
+		"gitlab.example.com": "gitlab.example.com",
+	}
+	for host, want := range cases {
+		if got := HostForPath(host); got != want {
+			t.Errorf("HostForPath(%q) = %q, want %q", host, got, want)
 		}
 	}
 }

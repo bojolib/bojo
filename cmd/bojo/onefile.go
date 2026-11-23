@@ -41,7 +41,7 @@ func buildOnefile(dir string, cfg *manifest.File, g *resolve.Graph, mojoBin stri
 	}
 	modulesDir := ""
 	includes := append(vendor.Roots(dir), cfg.Build.Include...)
-	if err := runHooks(cfg, g, "pre-build", dir); err != nil {
+	if err := runProjectHooks(cfg, "pre-build", dir); err != nil {
 		fail(err)
 		return exitBuild
 	}
@@ -90,7 +90,7 @@ func buildOnefile(dir string, cfg *manifest.File, g *resolve.Graph, mojoBin stri
 		fail(err)
 		return exitBuild
 	}
-	if err := runHooks(cfg, g, "post-build", dir); err != nil {
+	if err := runProjectHooks(cfg, "post-build", dir); err != nil {
 		fail(err)
 		return exitBuild
 	}

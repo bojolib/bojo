@@ -2,6 +2,7 @@ package vendor
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -25,13 +26,13 @@ func TestBuildIsFlatAndOneDirectoryPerModulePath(t *testing.T) {
 	src := t.TempDir()
 	project := t.TempDir()
 
-	// Two packages with the same short name from different repositories.
+	// Two repositories with the same last segment, different owners (D83).
 	a := pkgDir(t, src, "markus", "def connect() -> Int:\n    return 111\n")
 	b := pkgDir(t, src, "anna", "def connect() -> Int:\n    return 222\n")
 
 	g := &resolve.Graph{Packages: map[string]*resolve.Package{
-		"github.com.Markus.mojosocket": {Name: "mojosocket", Path: "github.com.Markus.mojosocket", Dir: a, Commit: strings.Repeat("a", 40)},
-		"github.com.Anna.mojosocket":   {Name: "mojosocket", Path: "github.com.Anna.mojosocket", Dir: b, Commit: strings.Repeat("b", 40)},
+		"gh.Markus.mojosocket": {Name: "mojosocket", Path: "gh.Markus.mojosocket", Dir: a, Commit: strings.Repeat("a", 40)},
+		"gh.Anna.mojosocket":   {Name: "mojosocket", Path: "gh.Anna.mojosocket", Dir: b, Commit: strings.Repeat("b", 40)},
 	}}
 
 	m, err := Build(project, g)
@@ -42,10 +43,10 @@ func TestBuildIsFlatAndOneDirectoryPerModulePath(t *testing.T) {
 		t.Fatalf("entries = %d, want 2", len(m.Entries))
 	}
 	for _, want := range []string{
-		"github/com/Markus/mojosocket/__init__.mojo",
-		"github/com/Anna/mojosocket/__init__.mojo",
+		"gh/Markus/mojosocket/__init__.mojo",
+		"gh/Anna/mojosocket/__init__.mojo",
 	} {
-		if _, err := os.Stat(filepath.Join(project, Dir, filepath.FromSlash(want))); err != nil {
+		if _, err := os.Stat(filepath.Join(Modules(project), filepath.FromSlash(want))); err != nil {
 			t.Errorf("missing %s: %v", want, err)
 		}
 	}
@@ -57,8 +58,8 @@ func TestBuildGeneratesAliasShim(t *testing.T) {
 	dir := pkgDir(t, src, "addition", "def add(a: Int, b: Int) -> Int:\n    return a + b\n")
 
 	g := &resolve.Graph{Packages: map[string]*resolve.Package{
-		"github.com.LukasLow.bojo_demo_pkg.addition": {
-			Name: "addition", Path: "github.com.LukasLow.bojo_demo_pkg.addition",
+		"gh.LukasLow.mojo_addition": {
+			Name: "mojo_addition", Path: "gh.LukasLow.mojo_addition",
 			Dir: dir, Commit: strings.Repeat("c", 40), Alias: "mathx",
 		},
 	}}
@@ -66,12 +67,12 @@ func TestBuildGeneratesAliasShim(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	raw, err := os.ReadFile(filepath.Join(project, Dir, "mathx", "__init__.mojo"))
+	raw, err := os.ReadFile(filepath.Join(Modules(project), "mathx", "__init__.mojo"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := string(raw)
-	if !strings.Contains(got, "from github.com.LukasLow.bojo_demo_pkg.addition import *") {
+	if !strings.Contains(got, "from gh.LukasLow.mojo_addition import *") {
 		t.Fatalf("shim does not re-export the full path:\n%s", got)
 	}
 }
@@ -83,7 +84,7 @@ func TestBuildRejectsOnePathAtTwoCommits(t *testing.T) {
 
 	// The graph keys by path, so this can only be constructed directly.
 	g := &resolve.Graph{Packages: map[string]*resolve.Package{
-		"github.com.X.z": {Name: "z", Path: "github.com.X.z", Dir: dir, Commit: strings.Repeat("1", 40)},
+		"gh.X.z": {Name: "z", Path: "gh.X.z", Dir: dir, Commit: strings.Repeat("1", 40)},
 	}}
 	if _, err := Build(project, g); err != nil {
 		t.Fatal(err)
@@ -91,9 +92,64 @@ func TestBuildRejectsOnePathAtTwoCommits(t *testing.T) {
 
 	// A second package with the same path but another commit is rejected by the
 	// resolver already (g.add); Build keeps its own guard for hand-built graphs.
-	g.Packages["other"] = &resolve.Package{Name: "z2", Path: "github.com.X.z", Dir: dir, Commit: strings.Repeat("2", 40)}
+	g.Packages["other"] = &resolve.Package{Name: "z2", Path: "gh.X.z", Dir: dir, Commit: strings.Repeat("2", 40)}
 	if _, err := Build(project, g); err == nil {
 		t.Fatal("two commits for one module path must fail")
+	}
+}
+
+func TestBuildUsesGitArchiveAndHonoursExportIgnore(t *testing.T) {
+	src := t.TempDir()
+	project := t.TempDir()
+	dir := pkgDir(t, src, "http", "def get() -> Int:\n    return 1\n")
+	if err := os.WriteFile(filepath.Join(dir, ".gitattributes"), []byte("tests export-ignore\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "tests"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tests", "a.mojo"), []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A file that is not committed must not reach the vendor tree, because the
+	// vendored tree is the commit, not the working directory (D73).
+	if err := os.WriteFile(filepath.Join(dir, "scratch.mojo"), []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=bojo", "GIT_AUTHOR_EMAIL=bojo@example.com",
+			"GIT_COMMITTER_NAME=bojo", "GIT_COMMITTER_EMAIL=bojo@example.com",
+			"GIT_AUTHOR_DATE=2020-01-01T00:00:00Z", "GIT_COMMITTER_DATE=2020-01-01T00:00:00Z",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "-q")
+	git("add", ".gitattributes", "__init__.mojo", "tests/a.mojo")
+	git("commit", "-q", "-m", "fixture")
+	commit := git("rev-parse", "HEAD")
+
+	g := &resolve.Graph{Packages: map[string]*resolve.Package{
+		"gh.X.mojo_http": {Name: "mojo_http", Path: "gh.X.mojo_http", Dir: dir, Commit: commit},
+	}}
+	if _, err := Build(project, g); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(Modules(project), "gh/X/mojo_http/tests/a.mojo")); !os.IsNotExist(err) {
+		t.Fatalf("export-ignore must drop tests/, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(Modules(project), "gh/X/mojo_http/scratch.mojo")); !os.IsNotExist(err) {
+		t.Fatalf("an uncommitted file must not be vendored, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(Modules(project), "gh/X/mojo_http/__init__.mojo")); err != nil {
+		t.Fatalf("the committed body must be vendored: %v", err)
 	}
 }
 
@@ -109,15 +165,15 @@ func TestBuildHonoursExclude(t *testing.T) {
 	}
 
 	g := &resolve.Graph{Packages: map[string]*resolve.Package{
-		"github.com.X.http": {Name: "http", Path: "github.com.X.http", Dir: dir, Commit: strings.Repeat("3", 40), Exclude: []string{"tests/**"}},
+		"gh.X.mojo_http": {Name: "mojo_http", Path: "gh.X.mojo_http", Dir: dir, Commit: strings.Repeat("3", 40), Exclude: []string{"tests/**"}},
 	}}
 	if _, err := Build(project, g); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(project, Dir, "github/com/X/http/tests/a.mojo")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(Modules(project), "gh/X/mojo_http/tests/a.mojo")); !os.IsNotExist(err) {
 		t.Fatalf("tests/a.mojo must be excluded, stat err = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(project, Dir, "github/com/X/http/__init__.mojo")); err != nil {
+	if _, err := os.Stat(filepath.Join(Modules(project), "gh/X/mojo_http/__init__.mojo")); err != nil {
 		t.Fatalf("package body must be copied: %v", err)
 	}
 }

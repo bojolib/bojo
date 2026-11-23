@@ -59,21 +59,6 @@ func cmpInt(a, b int) int {
 	}
 }
 
-// ParseTag parses `<pkg>/vX.Y.Z[-pre]` for the given package name.
-// A tag without the package prefix, or with more than one slash, is rejected.
-func ParseTag(raw, pkg string) (Version, error) {
-	for _, sep := range []string{pkg + "@", pkg + "/"} {
-		if strings.HasPrefix(raw, sep) {
-			rest := strings.TrimPrefix(raw, sep)
-			if strings.ContainsAny(rest, "/@") {
-				return Version{}, fmt.Errorf("tag %q has more than one separator", raw)
-			}
-			return ParseVersion(rest)
-		}
-	}
-	return Version{}, fmt.Errorf("tag %q does not start with %q", raw, pkg+"@")
-}
-
 // ParseVersion parses `vX.Y.Z[-pre]`.
 func ParseVersion(s string) (Version, error) {
 	if !strings.HasPrefix(s, "v") {
@@ -100,32 +85,31 @@ func ParseVersion(s string) (Version, error) {
 	return Version{Major: nums[0], Minor: nums[1], Patch: nums[2], Pre: pre, Raw: s}, nil
 }
 
-// versionOf reads a tag either as `<pkg>/vX.Y.Z` or as a repository-wide
-// `vX.Y.Z` (D74). Both forms carry one version for the whole repository.
-func versionOf(raw, pkg string) (Version, bool) {
-	if v, err := ParseTag(raw, pkg); err == nil {
-		return v, true
+// versionOf reads a tag as a repository-wide `vX.Y.Z` (D83). A tag carrying a
+// package prefix (`pkg/vX.Y.Z`, `pkg@vX.Y.Z`) is ignored: one repository is one
+// package, so a prefixed tag would be ambiguous.
+func versionOf(raw string) (Version, bool) {
+	v, err := ParseVersion(raw)
+	if err != nil {
+		return Version{}, false
 	}
-	if v, err := ParseVersion(raw); err == nil {
-		return v, true
-	}
-	return Version{}, false
+	return v, true
 }
 
 // Find returns the tag name and version that `ref` selects.
-func Find(pkg, ref string, tags []string) (string, Version, error) {
+func Find(ref string, tags []string) (string, Version, error) {
 	type candidate struct {
 		raw string
 		v   Version
 	}
 	var cands []candidate
 	for _, t := range tags {
-		if v, ok := versionOf(t, pkg); ok {
+		if v, ok := versionOf(t); ok {
 			cands = append(cands, candidate{t, v})
 		}
 	}
 	if len(cands) == 0 {
-		return "", Version{}, fmt.Errorf("no version tags for package %q", pkg)
+		return "", Version{}, fmt.Errorf("no version tags (want vX.Y.Z)")
 	}
 
 	switch ref {
@@ -149,29 +133,29 @@ func Find(pkg, ref string, tags []string) (string, Version, error) {
 			return c.raw, c.v, nil
 		}
 	}
-	return "", Version{}, fmt.Errorf("package %q has no version %s", pkg, want)
+	return "", Version{}, fmt.Errorf("no version %s", want)
 }
 
-// Latest returns the highest version under `<pkg>/*`.
-func Latest(pkg string, tags []string) (Version, error) {
+// Latest returns the highest repository-wide version.
+func Latest(tags []string) (Version, error) {
 	var versions []Version
 	for _, t := range tags {
-		if v, ok := versionOf(t, pkg); ok {
+		if v, ok := versionOf(t); ok {
 			versions = append(versions, v)
 		}
 	}
 	if len(versions) == 0 {
-		return Version{}, fmt.Errorf("no version tags for package %q", pkg)
+		return Version{}, fmt.Errorf("no version tags (want vX.Y.Z)")
 	}
 	sort.Slice(versions, func(i, j int) bool { return versions[i].Compare(versions[j]) > 0 })
 	return versions[0], nil
 }
 
-// Match resolves a user reference ("latest", "v0.0.1", "0.0.1") for a package.
-func Match(pkg, ref string, tags []string) (Version, error) {
+// Match resolves a user reference ("latest", "v0.0.1", "0.0.1").
+func Match(ref string, tags []string) (Version, error) {
 	switch ref {
 	case "", "latest":
-		return Latest(pkg, tags)
+		return Latest(tags)
 	case "main", "master":
 		return Version{}, fmt.Errorf("branch %q is not a version; pin a tag or a commit", ref)
 	}
@@ -184,9 +168,9 @@ func Match(pkg, ref string, tags []string) (Version, error) {
 		return Version{}, err
 	}
 	for _, t := range tags {
-		if v, ok := versionOf(t, pkg); ok && v.Compare(want) == 0 {
+		if v, ok := versionOf(t); ok && v.Compare(want) == 0 {
 			return v, nil
 		}
 	}
-	return Version{}, fmt.Errorf("package %q has no version %s", pkg, want)
+	return Version{}, fmt.Errorf("no version %s", want)
 }

@@ -91,7 +91,10 @@ func (s *Store) Tags(repo string) ([]string, error) {
 
 // ResolveRef turns "latest", "v0.0.1" or a commit prefix into a concrete tag
 // (possibly empty) and commit.
-func (s *Store) ResolveRef(repo, pkgName, ref string) (tagName, commit string, err error) {
+// ResolveRef turns a reference (tag, "latest" or commit prefix) into a tag name
+// and a full commit. Tags are repository-wide: one repository, one package
+// (D83).
+func (s *Store) ResolveRef(repo, ref string) (tagName, commit string, err error) {
 	if isHexPrefix(ref) {
 		commit, err = s.resolveCommit(repo, ref)
 		return "", commit, err
@@ -100,7 +103,7 @@ func (s *Store) ResolveRef(repo, pkgName, ref string) (tagName, commit string, e
 	if err != nil {
 		return "", "", err
 	}
-	tagName, _, err = tag.Find(pkgName, ref, tags)
+	tagName, _, err = tag.Find(ref, tags)
 	if err != nil {
 		return "", "", err
 	}

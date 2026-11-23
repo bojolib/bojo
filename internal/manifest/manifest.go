@@ -69,8 +69,9 @@ func (d *DepSpec) UnmarshalTOML(v any) error {
 	return nil
 }
 
-// DepsFrom maps a repository URL to its packages: repo -> package -> spec.
-type DepsFrom map[string]map[string]DepSpec
+// DepsFrom maps a repository URL to its version: repo -> spec. One repository
+// is one package, so there is no package name in the key (D83).
+type DepsFrom map[string]DepSpec
 
 // DepFrom is one repository at one version, providing one or more packages.
 type DepFrom struct {
@@ -126,8 +127,11 @@ type File struct {
 	Deps     DepsTable             `toml:"deps"`
 	DepsFrom DepsFrom              `toml:"deps-from"`
 	Hooks    map[string][][]string `toml:"hooks"`
-	Alias    map[string]string     `toml:"alias"`
-	Linker   Linker                `toml:"linker"`
+	// Alias maps a module path to a short name the project may import: only the
+	// project may alias, never a library (D68). Keying by path, not by name, is
+	// what makes two repositories with the same name distinguishable.
+	Alias  map[string]string `toml:"alias"`
+	Linker Linker            `toml:"linker"`
 }
 
 // Load reads bojo.toml from dir and validates it.
@@ -180,17 +184,21 @@ func Load(dir string) (*File, error) {
 		}
 	}
 
-	for repo, pkgs := range f.DepsFrom {
+	for repo, spec := range f.DepsFrom {
 		if strings.TrimSpace(repo) == "" {
 			return nil, fmt.Errorf("%s: a deps-from entry needs a repository", path)
 		}
-		for name, spec := range pkgs {
-			if strings.TrimSpace(name) == "" {
-				return nil, fmt.Errorf("%s: deps-from %q has an empty package name", path, repo)
-			}
-			if n := len(spec.Alias); spec.Alias != "" && (strings.ContainsAny(spec.Alias, " \t/.\\:") || n == 0) {
-				return nil, fmt.Errorf("%s: alias %q for %s is not a plain name", path, spec.Alias, name)
-			}
+		if n := len(spec.Alias); spec.Alias != "" && (strings.ContainsAny(spec.Alias, " \t/.\\:") || n == 0) {
+			return nil, fmt.Errorf("%s: alias %q for %s is not a plain name", path, spec.Alias, repo)
+		}
+	}
+
+	for modulePath, alias := range f.Alias {
+		if strings.TrimSpace(modulePath) == "" {
+			return nil, fmt.Errorf("%s: an [alias] entry needs a module path", path)
+		}
+		if alias == "" || strings.ContainsAny(alias, " \t/.\\:") {
+			return nil, fmt.Errorf("%s: alias %q is not a plain name", path, alias)
 		}
 	}
 

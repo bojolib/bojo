@@ -1,25 +1,29 @@
-// Package pkg parses bojo.pkg.toml: the repository root file (repo metadata plus
-// an import list) and one file per package (DESIGN §5.2, D5/D5b/D42).
+// Package pkg parses bojo.pkg.toml: one repository, at most one library and at
+// most one command (DESIGN §5.2, D83).
+//
+// The repository name is the package name: it is derived from the repository
+// URL, never declared. There is no import list and no in-repo dependency graph
+// to walk — a repository is its package.
 package pkg
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/LukasLow/bojo/internal/urlkey"
 )
 
 // FileName is the only accepted name for a package file (D5).
 const FileName = "bojo.pkg.toml"
 
-// MojoRange is the compatibility window for a source package.
-type MojoRange struct {
-	Min string `toml:"min"`
-	Max string `toml:"max"`
-}
+// DirName is the fixed directory of a command package (D83).
+const DirName = "cmd"
+
+// EntryName is the fixed entry file of a command package.
+const EntryName = "main.mojo"
 
 // Repo is the repository-level block.
 type Repo struct {
@@ -42,27 +46,17 @@ type Linker struct {
 	Runtime []string `toml:"runtime"`
 }
 
-// Dep is a local dependency: another package in the same repository.
-type Dep struct {
-	InRepo string `toml:"in-repo"`
-	Path   string `toml:"path"`
-}
-
 // DepFrom is one repository at one version.
 type DepFrom struct {
 	Repo   string            `toml:"repo"`
 	Tag    string            `toml:"tag"`
 	Commit string            `toml:"commit"`
-	Libs   []string          `toml:"libs"`
 	Alias  map[string]string `toml:"alias"`
 }
 
-// Pkg is one package declared in a package file.
+// Pkg is the body of `[pkg]` (a library) or `[cmd]` (a command).
 type Pkg struct {
-	Kind        string                `toml:"kind"` // "" (library) or "cmd"
 	Entry       string                `toml:"entry"`
-	Modules     []string              `toml:"modules"`
-	Deps        map[string]Dep        `toml:"deps"`
 	Exclude     []string              `toml:"exclude"`
 	Description string                `toml:"description"`
 	Keywords    []string              `toml:"keywords"`
@@ -77,136 +71,71 @@ type Pkg struct {
 
 // File is the parsed shape of one bojo.pkg.toml.
 type File struct {
-	Schema int            `toml:"schema"`
-	Repo   Repo           `toml:"repo"`
-	Import []string       `toml:"import"`
-	Pkg    map[string]Pkg `toml:"pkg"`
+	Schema int  `toml:"schema"`
+	Repo   Repo `toml:"repo"`
+	Pkg    *Pkg `toml:"pkg"`
+	Cmd    *Pkg `toml:"cmd"`
 }
 
-// Package is a package after tree resolution, with the directory it lives in.
-type Package struct {
-	Name string
-	Dir  string
-	File string
-	Pkg
-}
-
-// Tree is the flattened model of a repository.
+// Tree is the model of one repository.
 type Tree struct {
-	Root     string
-	Repo     Repo
-	Packages map[string]Package
+	Root string
+	Repo Repo
+	// Name is the derived package name: the repository name as a Mojo
+	// identifier (D83).
+	Name string
+	Pkg  *Pkg
+	Cmd  *Pkg
 }
 
-// LoadTree reads the root package file in dir and follows its import list
-// transitively. Duplicate paths are deduplicated before the name check, so a
-// diamond import is legal (D5b); a cycle is an error.
+// LoadTree reads the package file in dir and validates the layout.
 func LoadTree(dir string) (*Tree, error) {
-	rootFile := filepath.Join(dir, FileName)
-	f, err := parseFile(rootFile)
+	path := filepath.Join(dir, FileName)
+	f, err := parseFile(path)
 	if err != nil {
 		return nil, err
 	}
 	if f.Repo.URL == "" {
-		return nil, fmt.Errorf("%s: [repo] url is required", rootFile)
+		return nil, fmt.Errorf("%s: [repo] url is required", path)
 	}
-
-	tree := &Tree{Root: dir, Repo: f.Repo, Packages: map[string]Package{}}
-
-	seen := map[string]bool{}
-	var walk func(path string, stack []string) error
-	walk = func(path string, stack []string) error {
-		abs, err := filepath.Abs(path)
-		if err != nil {
-			return err
-		}
-		// A cycle is detected on the current stack, so it must be checked before
-		// the "already merged" shortcut that makes diamonds legal (D5b).
-		for _, s := range stack {
-			if s == abs {
-				return fmt.Errorf("import cycle: %s", strings.Join(append(stack, abs), " -> "))
-			}
-		}
-		if seen[abs] {
-			return nil // diamond: already merged
-		}
-		seen[abs] = true
-
-		var pf *File
-		if abs == mustAbs(rootFile) {
-			pf = f
-		} else {
-			pf, err = parseFile(abs)
-			if err != nil {
-				return err
-			}
-		}
-
-		for name, p := range pf.Pkg {
-			if p.Kind != "" && p.Kind != "cmd" {
-				return fmt.Errorf("%s: pkg %q has kind %q (want \"cmd\" or empty)", abs, name, p.Kind)
-			}
-			if p.Kind == "cmd" && p.Entry == "" {
-				return fmt.Errorf("%s: cmd %q needs an entry", abs, name)
-			}
-			if strings.ContainsAny(name, "./\\ :") || name == "" {
-				return fmt.Errorf("%s: package name %q must be a plain identifier", abs, name)
-			}
-			if p.Kind == "" && len(p.Modules) == 0 {
-				return fmt.Errorf("%s: library %q needs at least one modules route", abs, name)
-			}
-			if existing, ok := tree.Packages[name]; ok {
-				return fmt.Errorf("package %q declared twice: %s and %s", name, existing.File, abs)
-			}
-			tree.Packages[name] = Package{Name: name, Dir: filepath.Dir(abs), File: abs, Pkg: p}
-		}
-
-		next := append(append([]string{}, stack...), abs)
-		for _, imp := range pf.Import {
-			if strings.Contains(imp, "..") {
-				return fmt.Errorf("%s: import %q must not contain \"..\"", abs, imp)
-			}
-			target := filepath.Join(tree.Root, imp, FileName)
-			if _, err := os.Stat(target); err != nil {
-				return fmt.Errorf("%s: import %q has no %s", abs, imp, FileName)
-			}
-			if err := walk(target, next); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	if err := walk(rootFile, nil); err != nil {
-		return nil, err
-	}
-	if len(tree.Packages) == 0 {
-		return nil, fmt.Errorf("%s: no [pkg.*] entries", rootFile)
-	}
-	return tree, nil
-}
-
-// Names returns the package names in sorted order.
-func (t *Tree) Names() []string {
-	names := make([]string, 0, len(t.Packages))
-	for n := range t.Packages {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	return names
-}
-
-func mustAbs(p string) string {
-	a, err := filepath.Abs(p)
+	name, err := urlkey.RepoName(f.Repo.URL)
 	if err != nil {
-		return p
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	return a
+	if f.Pkg == nil && f.Cmd == nil {
+		return nil, fmt.Errorf("%s: declare [pkg] (a library), [cmd] (a command) or both", path)
+	}
+
+	t := &Tree{Root: dir, Repo: f.Repo, Name: name, Pkg: f.Pkg, Cmd: f.Cmd}
+
+	// A library lives at the repository root: its __init__.mojo is the module
+	// entry. Where it keeps the rest is the author's decision (D83).
+	if f.Pkg != nil {
+		if _, err := os.Stat(filepath.Join(dir, "__init__.mojo")); err != nil {
+			return nil, fmt.Errorf("%s: [pkg] needs __init__.mojo at the repository root", path)
+		}
+	}
+	if f.Cmd != nil {
+		if f.Cmd.Entry == "" {
+			f.Cmd.Entry = DirName + "/" + EntryName
+		}
+		entry := filepath.Clean(filepath.FromSlash(f.Cmd.Entry))
+		if filepath.IsAbs(entry) || strings.HasPrefix(entry, "..") {
+			return nil, fmt.Errorf("%s: [cmd] entry %q must stay inside the repository", path, f.Cmd.Entry)
+		}
+		if _, err := os.Stat(filepath.Join(dir, entry)); err != nil {
+			return nil, fmt.Errorf("%s: [cmd] entry %q does not exist", path, f.Cmd.Entry)
+		}
+	}
+	return t, nil
 }
 
 func parseFile(path string) (*File, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("no %s in %s (a package must declare what it is)", FileName, filepath.Dir(path))
+		}
 		return nil, err
 	}
 	var f File

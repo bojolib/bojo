@@ -23,56 +23,76 @@ hooks.
 | File | Role | Committed |
 |---|---|---|
 | `bojo.toml` | what this project needs (`schema = 1`) | yes |
-| `bojo.pkg.toml` | repo root: `import = [...]`; per package: `[pkg.<name>]` | yes |
+| `bojo.pkg.toml` | repository root: `[repo]` plus at most one `[pkg]` and one `[cmd]` | yes |
 | `bojo.lock` | every dependency by module path with repo, tag, full commit, tree | yes |
 | `bojo.allow` | approved hooks (JSONL) | yes |
-| `.vendor/` | generated module root, one directory per module path | no |
-| `.bojo/` | cache, toolchains, build state | no |
+| `.vendor/` | `.vendor.json`: what was vendored, at which commit (`vendor --check`) | no |
+| `.bojo/` | module root (`-I`), cache, toolchains, build state | no |
 | `.out/` | build result | no |
 
 ## Import paths
 
 ```mojo
-from github.com.LukasLow.bojo_demo_pkg.cprint import banner
+from gh.LukasLow.mojo_tls import TLSContext
 ```
 
-`<host>.<owner>.<repo>.<package>` — where the author keeps the directory does not
-appear. Libraries always write the full path; only the project may alias, and
-only in `bojo.toml`:
+`<host>.<owner>.<repo>` — a repository is its package. The package name is the
+repository name as a Mojo identifier (`mojo-tls` → `mojo_tls`); it is never
+declared. The host is a short alias: `gh` (github.com), `gl` (gitlab.com),
+`cb` (codeberg.org), `sr` (git.sr.ht); any other host keeps its literal name.
+
+A repository holds one library (`[pkg]`, `__init__.mojo` at the root) and
+optionally one command (`[cmd]`, default `cmd/main.mojo`). A command is never
+imported and has no module path.
+
+Libraries always write the full path; only the project may alias, and only in
+`bojo.toml`, keyed by module path:
 
 ```toml
-[deps-from."https://github.com/LukasLow/bojo_demo_pkg"]
-cprint   = { version = "v0.0.1", as = "printer" }
-addition = "v0.0.2"
+[alias]
+"gh.nsalerni.mojo_tls" = "tls"
 ```
 
 ```mojo
-from printer import banner     # bojo generates .vendor/printer/__init__.mojo
+from tls import TLSContext     # bojo generates .vendor/tls/__init__.mojo
 ```
+
+## Local dependencies
+
+Develop a library next to the project before it is published:
+
+```toml
+[deps.local_socket]
+path = "../socket"
+```
+
+The import path comes from that directory's own `[repo] url`, so nothing changes
+when it is pushed and pinned. A local dependency is never written to `bojo.lock`
+and may not declare hooks.
 
 ## Versions
 
-One version per package, as a tag `<pkg>@vX.Y.Z` (`tls@v0.0.1`). The section is
-keyed by repository, each key is a package, each value its version;
-`"latest"` or a missing value means the highest tag. Two different commits for
-the same module path are an error — bojo never upgrades silently.
+One version per repository, as a tag `vX.Y.Z` (`v0.1.0`). It covers library and
+command. A prefixed tag (`pkg/vX`, `pkg@vX`) is ignored. `"latest"` or a missing
+value means the highest tag. Two different commits for the same module path are
+an error — bojo never upgrades silently.
 
 ## Commands
 
 ```
 bojo init                        create a project
-bojo get <url>#<pkg>@<version>    add a dependency (--as <name> to alias)
-bojo remove <pkg>                delete it from its repository table
+bojo get <url>@<version>         add a dependency (--as <name> to alias)
+bojo remove <url>                delete it from its repository table
 bojo update                      re-resolve and write bojo.lock
 bojo build [--locked]            build into .out/
-bojo run <url>#<pkg>@<version>    ephemeral build and run a command package
-bojo install <url>#<pkg>@<version>  ephemeral build -> ~/.bojo/bin
-bojo vendor [--check]            write or verify .vendor
+bojo run <url>@<version>         ephemeral build and run the repository's [cmd]
+bojo install <url>@<version>     ephemeral build -> ~/.bojo/bin
+bojo vendor [--check]            write .vendor and run vendor hooks; --check verifies only
 bojo validate                    manifests + graph + .vendor must agree
 bojo test                        run every _tests/*.mojo, exit 3 on failure
 bojo fmt [paths…]                run `mojo format`
-bojo docs <pkg> [path]           render docs/index.md or a file inside docs/
-bojo tree | why <pkg>            graph / provenance
+bojo docs <module-path> [path]   render docs/index.md or a file inside docs/
+bojo tree | why <module-path>    graph / provenance
 bojo verify                      check the lock against a fresh checkout
 bojo doctor                      toolchain, C compiler, triple, PATH
 bojo toolchain list|install|remove <mojo|python> [version]
@@ -99,14 +119,20 @@ Exit codes:
 
 ## Native code
 
-The package ships sources under `ffi`; the **consumer** compiles them in a
-`pre-build` hook. A library never runs a compiler on someone else's machine.
+The package ships sources under `ffi`; the **consumer** compiles them. A library
+never runs a compiler on someone else's machine.
+
+A package may declare its own compile step as a `vendor` hook: it runs **once**,
+when the source is materialised (`bojo vendor`, `update`, `get`, `run`), in the
+store checkout — never on `bojo build`. Its output belongs in `.bojo/`, not in
+`.vendor/`. Hooks need approval; the line lands in `bojo.allow`, which is
+committed so CI can run them unattended.
 
 ```toml
-[pkg.cprint]
-modules = ["cprint"]
+[pkg]
+description = "C printing helpers"
 
-[pkg.cprint.linker]
+[pkg.linker]
 libs = ["cprint"]
 ffi  = ["cprint.c"]
 ```
@@ -118,7 +144,7 @@ libs    = ["cprint"]
 
 [hooks]
 pre-build = [
-  ["sh", "-c", "mkdir -p .bojo/native && cc -shared -fPIC -O2 -o .bojo/native/libcprint.so .vendor/github/com/Owner/repo/cprint/cprint.c"],
+  ["sh", "-c", "mkdir -p .bojo/native && cc -shared -fPIC -O2 -o .bojo/native/libcprint.so .vendor/gh/Owner/repo/cprint.c"],
 ]
 ```
 
@@ -144,7 +170,9 @@ python = "3.12"
 numpy = "2.1.0"
 ```
 
-`bojo toolchain install python 3.12` once. Wheels only, hashed, installed
+`bojo toolchain install python 3.12` once. A toolchain pinned in `bojo.toml`
+but missing on the machine is installed automatically on first use — mojo and
+python alike — and bojo prints what it downloads. Wheels only, hashed, installed
 offline into `.bojo/cache/python/…`; the launcher sets `PYTHONHOME`,
 `PYTHONPATH`, `MOJO_PYTHON_LIBRARY`.
 

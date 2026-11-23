@@ -17,153 +17,141 @@ func write(t *testing.T, dir, rel, content string) {
 	}
 }
 
-const rootWithImports = `
-import = ["lib/a", "lib/b"]
+const manifest = `schema = 1
 
 [repo]
-url     = "https://github.com/Owner/Repo"
+url     = "https://github.com/Owner/mojo-tls"
 license = "Apache-2.0"
+
+[pkg]
+description = "TLS for Mojo"
 `
 
-func TestLoadTreeDiamondIsAllowed(t *testing.T) {
+func TestNameIsDerivedFromTheRepository(t *testing.T) {
 	dir := t.TempDir()
-	write(t, dir, "bojo.pkg.toml", `
-import = ["lib/a", "lib/b"]
-
-[repo]
-url = "https://github.com/Owner/Repo"
-`)
-	write(t, dir, "lib/a/bojo.pkg.toml", `
-import = ["lib/common"]
-[pkg.a]
-modules = ["a"]
-`)
-	write(t, dir, "lib/b/bojo.pkg.toml", `
-import = ["lib/common"]
-[pkg.b]
-modules = ["b"]
-`)
-	write(t, dir, "lib/common/bojo.pkg.toml", `
-[pkg.common]
-modules = ["common"]
-`)
+	write(t, dir, "bojo.pkg.toml", manifest)
+	write(t, dir, "__init__.mojo", "")
 
 	tree, err := LoadTree(dir)
 	if err != nil {
-		t.Fatalf("diamond import must be allowed: %v", err)
+		t.Fatal(err)
 	}
-	if len(tree.Packages) != 3 {
-		t.Fatalf("got %d packages, want 3", len(tree.Packages))
+	// A dash is not a Mojo identifier, so it becomes an underscore (D83).
+	if tree.Name != "mojo_tls" {
+		t.Fatalf("name = %q, want mojo_tls", tree.Name)
 	}
-	if tree.Packages["a"].Dir != filepath.Join(dir, "lib/a") {
-		t.Fatalf("package dir = %q", tree.Packages["a"].Dir)
+	if tree.Pkg == nil || tree.Cmd != nil {
+		t.Fatalf("tree = %+v", tree)
 	}
 }
 
-func TestLoadTreeRejectsCycle(t *testing.T) {
+func TestLibraryNeedsInitAtTheRoot(t *testing.T) {
 	dir := t.TempDir()
-	write(t, dir, "bojo.pkg.toml", rootWithImports)
-	write(t, dir, "lib/a/bojo.pkg.toml", `
-import = ["lib/b"]
-[pkg.a]
-modules = ["a"]
-`)
-	write(t, dir, "lib/b/bojo.pkg.toml", `
-import = ["lib/a"]
-[pkg.b]
-modules = ["b"]
-`)
+	write(t, dir, "bojo.pkg.toml", manifest)
 	if _, err := LoadTree(dir); err == nil {
-		t.Fatal("cycle must be rejected")
+		t.Fatal("a [pkg] without __init__.mojo at the repository root must be rejected")
 	}
 }
 
-func TestLoadTreeRejectsDuplicatePackage(t *testing.T) {
+func TestCommandDefaultsToCmdMain(t *testing.T) {
 	dir := t.TempDir()
-	write(t, dir, "bojo.pkg.toml", rootWithImports)
-	write(t, dir, "lib/a/bojo.pkg.toml", `
-[pkg.same]
-modules = ["a"]
-`)
-	write(t, dir, "lib/b/bojo.pkg.toml", `
-[pkg.same]
-modules = ["b"]
-`)
-	if _, err := LoadTree(dir); err == nil {
-		t.Fatal("duplicate package name must be rejected")
-	}
-}
-
-func TestLoadTreeRejectsParentTraversal(t *testing.T) {
-	dir := t.TempDir()
-	write(t, dir, "bojo.pkg.toml", `
-import = ["../outside"]
-
+	write(t, dir, "bojo.pkg.toml", `schema = 1
 [repo]
-url = "https://github.com/Owner/Repo"
+url = "https://github.com/Owner/tool"
+[cmd]
+`)
+	write(t, dir, "cmd/main.mojo", "def main():\n    pass\n")
 
-[pkg.a]
-modules = ["a"]
+	tree, err := LoadTree(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tree.Cmd == nil || tree.Pkg != nil {
+		t.Fatalf("tree = %+v", tree)
+	}
+	if tree.Cmd.Entry != "cmd/main.mojo" {
+		t.Fatalf("entry = %q", tree.Cmd.Entry)
+	}
+}
+
+func TestCommandEntryMustExist(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "bojo.pkg.toml", `schema = 1
+[repo]
+url = "https://github.com/Owner/tool"
+[cmd]
+entry = "cmd/other.mojo"
 `)
 	if _, err := LoadTree(dir); err == nil {
-		t.Fatal("import with .. must be rejected")
+		t.Fatal("a missing [cmd] entry must be rejected")
+	}
+}
+
+func TestCommandEntryMustStayInside(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "bojo.pkg.toml", `schema = 1
+[repo]
+url = "https://github.com/Owner/tool"
+[cmd]
+entry = "../outside.mojo"
+`)
+	if _, err := LoadTree(dir); err == nil {
+		t.Fatal("an entry outside the repository must be rejected")
+	}
+}
+
+func TestEmptyPackageIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "bojo.pkg.toml", `schema = 1
+[repo]
+url = "https://github.com/Owner/empty"
+`)
+	if _, err := LoadTree(dir); err == nil {
+		t.Fatal("a manifest without [pkg] and [cmd] must be rejected")
+	}
+}
+
+func TestRepoURLIsRequired(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "bojo.pkg.toml", "[pkg]\n")
+	if _, err := LoadTree(dir); err == nil {
+		t.Fatal("[repo] url is required")
 	}
 }
 
 func TestParseRejectsUnknownKeys(t *testing.T) {
 	dir := t.TempDir()
-	write(t, dir, "bojo.pkg.toml", `
+	write(t, dir, "bojo.pkg.toml", `schema = 1
 [repo]
-url = "https://github.com/Owner/Repo"
+url      = "https://github.com/Owner/Repo"
 surprise = 1
-[pkg.a]
-modules = ["a"]
+[pkg]
 `)
 	if _, err := LoadTree(dir); err == nil {
 		t.Fatal("unknown keys must be rejected")
 	}
 }
 
-func TestLibraryNeedsModules(t *testing.T) {
-	dir := t.TempDir()
-	write(t, dir, "bojo.pkg.toml", `
-[repo]
-url = "https://github.com/Owner/Repo"
-[pkg.a]
-`)
-	if _, err := LoadTree(dir); err == nil {
-		t.Fatal("a library without modules must be rejected")
-	}
-}
-
 func TestPackageMetadataIsOptional(t *testing.T) {
 	dir := t.TempDir()
-	root := filepath.Join(dir, "bojo.pkg.toml")
-	if err := os.WriteFile(root, []byte("schema = 1\nimport = [\"lib/request\"]\n\n[repo]\nurl = \"https://github.com/x/y\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(dir, "lib", "request"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	body := `schema = 1
+	write(t, dir, "__init__.mojo", "")
+	write(t, dir, "bojo.pkg.toml", `schema = 1
 
-[pkg.request]
-modules     = ["request"]
+[repo]
+url = "https://github.com/x/mojo_http"
+
+[pkg]
 description = "HTTP GET through libcurl"
 keywords    = ["http", "network"]
 license     = "Apache-2.0"
 homepage    = "https://example.com"
 readme      = "README.md"
-`
-	if err := os.WriteFile(filepath.Join(dir, "lib", "request", "bojo.pkg.toml"), []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
+`)
 	tree, err := LoadTree(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := tree.Packages["request"]
+	p := tree.Pkg
 	if p.Description != "HTTP GET through libcurl" {
 		t.Errorf("description = %q", p.Description)
 	}

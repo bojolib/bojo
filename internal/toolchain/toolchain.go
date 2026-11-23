@@ -69,7 +69,10 @@ func Resolve(version string) (string, error) {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("mojo %s is not installed (run `bojo toolchain install %s`)", version, version)
+	// The version is pinned in bojo.toml and nowhere on this machine: fetch it.
+	// A build must not fail because one install command was forgotten (D86).
+	fmt.Printf("mojo %s is not installed; installing it into ~/.bojo/mojo/%s\n", version, version)
+	return Install(version)
 }
 
 // List returns the installed versions.

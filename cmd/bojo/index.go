@@ -15,6 +15,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"github.com/LukasLow/bojo/internal/manifest"
+	"github.com/LukasLow/bojo/internal/pkg"
 	"github.com/LukasLow/bojo/internal/toolchain"
 	"github.com/LukasLow/bojo/internal/urlkey"
 	"github.com/LukasLow/bojo/internal/vendor"
@@ -106,19 +107,16 @@ func cmdRepoIndex(args []string) int {
 		return exitUsage
 	}
 
-	// Tags name their package (D79); the highest one per package wins.
-	perPkg := map[string]string{}
-	if ref == "" {
-		perPkg, err = tagsByPackage(raw)
-		if err != nil {
-			fail(err)
-			return exitNetwork
-		}
-	}
-
+	// One repository is one package, so the version is the repository tag (D83).
+	version := ref
 	base := ref
 	if base == "" {
-		base = "HEAD"
+		if t, err := latestTag(raw); err == nil {
+			base, version = t, t
+		}
+	}
+	if base == "" {
+		base, version = "HEAD", "unreleased"
 	}
 	sha, err := refSHA(raw, base)
 	if err != nil {
@@ -126,7 +124,7 @@ func cmdRepoIndex(args []string) int {
 		return exitNetwork
 	}
 
-	entries, err := indexRepo(norm, raw, sha, ref, perPkg, follow, 0)
+	entries, err := indexRepo(norm, raw, sha, version, follow, 0)
 	if err != nil {
 		fail(err)
 		return exitNetwork
@@ -141,163 +139,70 @@ func cmdRepoIndex(args []string) int {
 	return exitOK
 }
 
-// tagsByPackage maps a package name to its highest version tag.
-func tagsByPackage(raw string) (map[string]string, error) {
-	out, err := exec.Command("git", "ls-remote", "--tags", "--refs", raw).Output()
-	if err != nil {
-		return nil, fmt.Errorf("listing tags of %s: %w", raw, err)
-	}
-	best := map[string]tagVersion{}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		t := strings.TrimPrefix(fields[1], "refs/tags/")
-		at := strings.IndexByte(t, '@')
-		if at <= 0 {
-			continue
-		}
-		pkg, ver := t[:at], t[at+1:]
-		cand := tagVersion{raw: t, version: ver}
-		if prev, ok := best[pkg]; !ok || cand.version > prev.version {
-			best[pkg] = cand
-		}
-	}
-	res := map[string]string{}
-	for pkg, tv := range best {
-		res[pkg] = tv.raw
-	}
-	return res, nil
-}
+// ---------------------------------------------------------------------------
+// bojo repo-index: one entry per repository
 
-type tagVersion struct {
-	raw     string
-	version string
-}
-
-// indexRepo reads the root manifest, then every package manifest at the commit
-// that its own tag points to.
-func indexRepo(norm, raw, sha, forced string, perPkg map[string]string, follow bool, depth int) ([]indexEntry, error) {
+// indexRepo reads bojo.pkg.toml at one commit and returns its library. A
+// command-only repository has nothing to import, so it yields no entry.
+func indexRepo(norm, raw, sha, version string, follow bool, depth int) ([]indexEntry, error) {
 	body, err := fetchRaw(norm, sha, "bojo.pkg.toml")
 	if err != nil {
 		return nil, fmt.Errorf("%s has no readable bojo.pkg.toml: %w", norm, err)
 	}
-	var root struct {
-		Import []string `toml:"import"`
-	}
-	if err := toml.Unmarshal(body, &root); err != nil {
+	var f pkg.File
+	if err := toml.Unmarshal(body, &f); err != nil {
 		return nil, fmt.Errorf("%s: %w", norm, err)
 	}
-
-	type linker struct {
-		Libs    []string `toml:"libs"`
-		FFI     []string `toml:"ffi"`
-		Runtime []string `toml:"runtime"`
+	if f.Pkg == nil {
+		return nil, nil
 	}
-	type pkgEntry struct {
-		Modules     []string              `toml:"modules"`
-		Description string                `toml:"description"`
-		Keywords    []string              `toml:"keywords"`
-		License     string                `toml:"license"`
-		Homepage    string                `toml:"homepage"`
-		Readme      string                `toml:"readme"`
-		Docs        string                `toml:"docs"`
-		Hooks       map[string][][]string `toml:"hooks"`
-		Linker      linker                `toml:"linker"`
-		DepsFrom    []struct {
-			Repo string   `toml:"repo"`
-			Libs []string `toml:"libs"`
-		} `toml:"deps-from"`
+	name, err := urlkey.RepoName(raw)
+	if err != nil {
+		return nil, err
 	}
-	var out []indexEntry
-	cache := map[string]string{}
-
-	for _, imp := range root.Import {
-		imp = strings.TrimSuffix(strings.TrimPrefix(imp, "./"), "/")
-		path := filepath.ToSlash(filepath.Join(imp, "bojo.pkg.toml"))
-		rawManifest, err := fetchRaw(norm, sha, path)
+	modPath, err := urlkey.ModulePath(norm)
+	if err != nil {
+		return nil, err
+	}
+	var deps []string
+	for _, d := range f.Pkg.DepsFrom {
+		dn, err := urlkey.Normalize(d.Repo)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", norm, err)
+			continue
 		}
-		var probe struct {
-			Pkg map[string]pkgEntry `toml:"pkg"`
+		if mp, err := urlkey.ModulePath(dn); err == nil {
+			deps = append(deps, mp)
 		}
-		if err := toml.Unmarshal(rawManifest, &probe); err != nil {
-			return nil, fmt.Errorf("%s: %s: %w", norm, path, err)
-		}
-
-		for name := range probe.Pkg {
-			version := forced
-			realTag := forced
-			atSHA := sha
-			if version == "" {
-				if tag, ok := perPkg[name]; ok {
-					realTag = tag
-					atSHA, err = refSHA(raw, tag)
-					if err != nil {
-						return nil, err
-					}
-					version = tag[strings.IndexByte(tag, '@')+1:]
-					if atSHA != sha {
-						if m, err := fetchRaw(norm, atSHA, path); err == nil {
-							rawManifest = m
-							_ = toml.Unmarshal(m, &probe)
-						}
-					}
-				} else {
-					version = "unreleased"
-				}
+	}
+	p := f.Pkg
+	out := []indexEntry{{
+		Path: modPath, Pkg: name, Dir: ".", Version: version, Tag: version,
+		Description: p.Description, Keywords: p.Keywords, License: p.License,
+		Homepage: p.Homepage, Readme: p.Readme, Docs: p.Docs,
+		Hooks: hookNames(p.Hooks), FFI: len(p.Linker.FFI) > 0,
+		Runtime: len(p.Linker.Runtime) > 0, Deps: deps,
+	}}
+	if follow && depth < 1 {
+		seen := map[string]bool{}
+		for _, d := range f.Pkg.DepsFrom {
+			dn, err := urlkey.Normalize(d.Repo)
+			if err != nil || seen[dn] {
+				continue
 			}
-			p := probe.Pkg[name]
-			modPath, err := urlkey.ModulePath(norm, name)
+			seen[dn] = true
+			base, ver := "HEAD", "unreleased"
+			if d.Tag != "" {
+				base, ver = d.Tag, d.Tag
+			}
+			subSHA, err := refSHA(d.Repo, base)
 			if err != nil {
-				return nil, err
+				continue
 			}
-			var deps []string
-			for _, d := range p.DepsFrom {
-				dn, err := urlkey.Normalize(d.Repo)
-				if err != nil {
-					continue
-				}
-				for _, lib := range d.Libs {
-					if mp, err := urlkey.ModulePath(dn, lib); err == nil {
-						deps = append(deps, mp)
-					}
-				}
+			nested, err := indexRepo(dn, d.Repo, subSHA, ver, false, depth+1)
+			if err != nil {
+				continue
 			}
-			out = append(out, indexEntry{
-				Path: modPath, Pkg: name, Dir: imp, Version: version, Tag: realTag,
-				Description: p.Description, Keywords: p.Keywords, License: p.License,
-				Homepage: p.Homepage, Readme: p.Readme, Docs: p.Docs,
-				Hooks: hookNames(p.Hooks), FFI: len(p.Linker.FFI) > 0,
-				Runtime: len(p.Linker.Runtime) > 0, Deps: deps,
-			})
-			if follow && depth < 1 {
-				for _, d := range p.DepsFrom {
-					dn, err := urlkey.Normalize(d.Repo)
-					if err != nil {
-						continue
-					}
-					if _, seen := cache[dn]; seen {
-						continue
-					}
-					cache[dn] = "1"
-					subTags, err := tagsByPackage(d.Repo)
-					if err != nil {
-						continue
-					}
-					subHead, err := refSHA(d.Repo, "HEAD")
-					if err != nil {
-						continue
-					}
-					nested, err := indexRepo(dn, d.Repo, subHead, "", subTags, false, depth+1)
-					if err != nil {
-						continue
-					}
-					out = append(out, nested...)
-				}
-			}
+			out = append(out, nested...)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
@@ -596,7 +501,7 @@ func cmdTest(args []string) int {
 
 	failed := 0
 	for _, f := range files {
-		cmd := exec.Command(mojoBin, "run", f, "-I", ".", "-I", vendor.Dir)
+		cmd := exec.Command(mojoBin, "run", f, "-I", ".", "-I", vendor.Roots(dir)[0])
 		cmd.Dir = dir
 		out, err := cmd.CombinedOutput()
 		if err != nil {

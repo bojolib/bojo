@@ -44,7 +44,13 @@ func Ensure(projectDir, version string, packages map[string]string) (*Result, er
 	}
 	interpreter, ok := toolchain.PythonInstalled(version)
 	if !ok {
-		return nil, fmt.Errorf("python %s is not installed (run `bojo toolchain install python %s`)", version, version)
+		// A build must not fail because one install command was forgotten (D86).
+		fmt.Printf("python %s is not installed; installing it into ~/.bojo/python/%s\n", version, version)
+		var err error
+		interpreter, err = toolchain.PythonInstall(version)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	specs := make([]string, 0, len(packages))

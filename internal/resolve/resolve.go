@@ -1,5 +1,8 @@
 // Package resolve turns bojo.toml plus remote repositories into a flat graph:
-// every package, its import routes, its linker flags and the hooks it wants.
+// every package, its import route, its linker flags and the hooks it wants.
+//
+// One repository is one package (D83), so resolution has no in-repo graph to
+// walk and no tag namespace to disambiguate.
 package resolve
 
 import (
@@ -19,7 +22,7 @@ import (
 // Package is one resolved package.
 type Package struct {
 	Name string
-	// Path is the import path, host.owner.repo.package (D65).
+	// Path is the import path, <host>.<owner>.<repo> (D82/D83).
 	Path   string
 	Alias  string
 	Repo   string // normalised URL
@@ -29,10 +32,7 @@ type Package struct {
 	Dir    string
 
 	Routes []string
-	// DeclaredRoutes are the routes as authored, before any alias (used when
-	// rewriting imports in a vendor copy).
-	DeclaredRoutes []string
-	// Deps are the package names this package depends on.
+	// Deps are the module paths this package depends on.
 	Deps []string
 	// Direct marks a package the project asked for itself.
 	Direct  bool
@@ -64,6 +64,9 @@ type LockEntry struct {
 // Graph is the resolved model of a build.
 type Graph struct {
 	Packages map[string]*Package
+	// Commands holds repositories that ship a [cmd], keyed by normalised URL.
+	// A command is run, never imported, so it has no route (D83).
+	Commands map[string]*Package
 	Routes   []Route
 	Hooks    []hooks.Requirement
 	Lock     []LockEntry
@@ -81,44 +84,50 @@ type Resolver struct {
 type job struct {
 	direct bool
 	repo   string
-	tag    string
+	ref    string
 	commit string
-	libs   []string
-	alias  map[string]string
+	// dir is set for a local dependency: the source is a working directory, not
+	// a checkout at a commit (D85).
+	dir string
+}
+
+// projectDir is the directory bojo.toml lives in: the cache sits below
+// <project>/.bojo/cache (D32).
+func (r *Resolver) projectDir() string {
+	return filepath.Dir(filepath.Dir(r.Store.Root()))
 }
 
 // Resolve walks the dependency graph starting from the project manifest.
 func (r *Resolver) Resolve(cfg *manifest.File) (*Graph, error) {
-	g := &Graph{Packages: map[string]*Package{}}
-
-	for name, d := range cfg.Deps.Local {
-		return nil, fmt.Errorf("local dependency %q (deps.%s.path = %q) is not implemented yet; use a repository URL", name, name, d.Path)
-	}
+	g := &Graph{Packages: map[string]*Package{}, Commands: map[string]*Package{}}
 
 	var queue []job
-	for repo, pkgs := range cfg.DepsFrom {
-		for name, spec := range pkgs {
-			version := spec.Version
-			if version == "" {
-				version = "latest"
-			}
-			alias := map[string]string{}
-			if spec.Alias != "" {
-				alias[name] = spec.Alias
-			}
-			for k, v := range cfg.Alias {
-				alias[k] = v
-			}
-			queue = append(queue, job{
-				direct: true, repo: repo, tag: name + "@" + version,
-				libs: []string{name}, alias: alias,
-			})
+	for label, d := range cfg.Deps.Local {
+		if d.Path == "" {
+			return nil, fmt.Errorf("local dependency %q needs a path", label)
 		}
+		dir := d.Path
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(r.projectDir(), dir)
+		}
+		pt, err := pkg.LoadTree(dir)
+		if err != nil {
+			return nil, fmt.Errorf("local dependency %q: %w", label, err)
+		}
+		if len(pt.Pkg.Hooks) > 0 || (pt.Cmd != nil && len(pt.Cmd.Hooks) > 0) {
+			return nil, fmt.Errorf("local dependency %q cannot declare hooks: an unpinned tree has nothing to approve", label)
+		}
+		queue = append(queue, job{direct: true, repo: pt.Repo.URL, dir: dir})
+	}
+	for repo, spec := range cfg.DepsFrom {
+		ref := spec.Version
+		if ref == "" {
+			ref = "latest"
+		}
+		queue = append(queue, job{direct: true, repo: repo, ref: ref})
 	}
 
-	fetched := map[string]string{} // "<repo>@<commit>" -> checkout dir
-	expanded := map[string]bool{}  // repository already walked for nested deps
-	processed := map[string]bool{} // "<repo>@<commit>/<libs>" already merged
+	expanded := map[string]bool{} // repository already walked for nested deps
 
 	for len(queue) > 0 {
 		j := queue[0]
@@ -129,178 +138,78 @@ func (r *Resolver) Resolve(cfg *manifest.File) (*Graph, error) {
 			return nil, err
 		}
 
-		var tagName, commit string
-		if j.commit != "" {
-			_, commit, err = r.Store.ResolveRef(norm, "", j.commit)
+		var tagName, commit, tree string
+		var dir string
+		if j.dir != "" {
+			dir = j.dir
 		} else {
-			// A tag is repository-wide (D74); the <pkg>/ prefix is only kept
-			// for repositories that still use per-package tags.
-			pkgForTag := ""
-			ref := j.tag
-			if i := strings.IndexAny(ref, "@/"); i > 0 {
-				pkgForTag, ref = ref[:i], ref[i+1:]
+			if j.commit != "" {
+				_, commit, err = r.Store.ResolveRef(norm, j.commit)
+			} else {
+				tagName, commit, err = r.Store.ResolveRef(norm, j.ref)
 			}
-			tagName, commit, err = r.Store.ResolveRef(norm, pkgForTag, ref)
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		key := norm + "@" + commit
-		dir, ok := fetched[key]
-		if !ok {
+			if err != nil {
+				return nil, err
+			}
+			key := norm + "@" + commit
 			dir, err = r.Store.Ensure(norm, tagName, commit, r.Locked[key])
 			if err != nil {
 				return nil, err
 			}
-			fetched[key] = dir
-		}
-
-		tree, err := r.Store.TreeOf(dir)
-		if err != nil {
-			return nil, err
+			tree, err = r.Store.TreeOf(dir)
+			if err != nil {
+				return nil, err
+			}
 		}
 		pt, err := pkg.LoadTree(dir)
 		if err != nil {
 			return nil, err
 		}
+		modPath, err := urlkey.ModulePath(norm)
+		if err != nil {
+			return nil, err
+		}
 
-		for _, lib := range j.libs {
-			p, ok := pt.Packages[lib]
-			if !ok {
-				return nil, fmt.Errorf("%s: no package %q (have: %s)", norm, lib, strings.Join(pt.Names(), ", "))
+		// A command is run, never imported: it has no module path and therefore
+		// cannot collide with anything (D83).
+		if pt.Pkg != nil {
+			// A library never runs a compiler on someone else's machine (D57):
+			// its only hook phase is "vendor", which runs once when the source
+			// is materialised, in the store, never inside .vendor (D84).
+			if err := checkPkgHooks(pt.Pkg.Hooks); err != nil {
+				return nil, fmt.Errorf("%s: %w", norm, err)
 			}
-			if processed[key+"/"+lib] {
-				continue
-			}
-			processed[key+"/"+lib] = true
-
-			deps := make([]string, 0, len(p.Deps)+len(p.DepsFrom))
-			for _, d := range p.Deps {
-				if dp, err := urlkey.ModulePath(norm, d.InRepo); err == nil {
-					deps = append(deps, dp)
-				}
-			}
-			for _, d := range p.DepsFrom {
-				dn, err := urlkey.Normalize(d.Repo)
-				if err != nil {
-					return nil, err
-				}
-				for _, lib := range d.Libs {
-					if dp, err := urlkey.ModulePath(dn, lib); err == nil {
-						deps = append(deps, dp)
-					}
-				}
-			}
-			modPath, err := urlkey.ModulePath(norm, p.Name)
+			deps, err := depPaths(pt)
 			if err != nil {
 				return nil, err
 			}
-
-			if err := g.add(Package{
-				Name: p.Name, Path: modPath, Repo: norm, Commit: commit, Tag: tagName, Tree: tree,
-				Dir: p.Dir, Routes: p.Modules, DeclaredRoutes: p.Modules, Deps: deps,
-				Direct: j.direct, Kind: p.Kind, Entry: p.Entry,
-				Linker: p.Linker, Exclude: p.Exclude, Docs: p.Docs, Hooks: p.Hooks,
-			}, j.alias); err != nil {
+			err = g.add(Package{
+				Name: pt.Name, Path: modPath, Repo: norm, Commit: commit, Tag: tagName,
+				Tree: tree, Dir: pt.Root, Routes: []string{modPath}, Deps: deps,
+				Direct: j.direct, Linker: pt.Pkg.Linker, Exclude: pt.Pkg.Exclude,
+				Docs: pt.Pkg.Docs, Hooks: pt.Pkg.Hooks,
+			}, cfg.Alias[modPath])
+			if err != nil {
 				return nil, err
 			}
+		}
 
-			for depName, d := range p.Deps {
-				if d.InRepo == "" {
-					return nil, fmt.Errorf("%s: package %q: dependency %q needs in-repo (path dependencies are not implemented yet)", norm, p.Name, depName)
-				}
-				dp, ok := pt.Packages[d.InRepo]
-				if !ok {
-					return nil, fmt.Errorf("%s: package %q: in-repo dependency %q not found", norm, p.Name, d.InRepo)
-				}
-				subDeps := make([]string, 0, len(dp.Deps)+len(dp.DepsFrom))
-				for _, d := range dp.Deps {
-					if dpath, err := urlkey.ModulePath(norm, d.InRepo); err == nil {
-						subDeps = append(subDeps, dpath)
-					}
-				}
-				for _, d := range dp.DepsFrom {
-					dn, err := urlkey.Normalize(d.Repo)
-					if err != nil {
-						return nil, err
-					}
-					for _, lib := range d.Libs {
-						if dpath, err := urlkey.ModulePath(dn, lib); err == nil {
-							subDeps = append(subDeps, dpath)
-						}
-					}
-				}
-				subPath, err := urlkey.ModulePath(norm, dp.Name)
-				if err != nil {
-					return nil, err
-				}
-				if err := g.add(Package{
-					Name: dp.Name, Path: subPath, Repo: norm, Commit: commit, Tag: tagName, Tree: tree,
-					Dir: dp.Dir, Routes: dp.Modules, DeclaredRoutes: dp.Modules,
-					Deps: subDeps, Kind: dp.Kind, Entry: dp.Entry,
-					Linker: dp.Linker, Exclude: dp.Exclude, Docs: dp.Docs, Hooks: dp.Hooks,
-				}, nil); err != nil {
-					return nil, err
-				}
+		if pt.Pkg == nil && pt.Cmd != nil {
+			// A command-only repository is not importable, but `run`/`install`
+			// must find its checkout and entry (D83).
+			g.Commands[norm] = &Package{
+				Name: pt.Name, Repo: norm, Commit: commit, Tag: tagName, Tree: tree,
+				Dir: dir, Kind: "cmd", Entry: pt.Cmd.Entry, Direct: j.direct,
 			}
 		}
 
-		// Close over in-repo dependencies: A -> B -> C must put C in the graph
-		// too, otherwise B cannot be built (R4).
-		for changed := true; changed; {
-			changed = false
-			for _, dp := range pt.Packages {
-				modPath, err := urlkey.ModulePath(norm, dp.Name)
-				if err != nil {
-					return nil, err
-				}
-				if _, present := g.Packages[modPath]; !present {
-					continue
-				}
-				var subDeps []string
-				for _, d := range dp.Deps {
-					subDeps = append(subDeps, d.InRepo)
-				}
-				for _, ref := range subDeps {
-					child, ok := pt.Packages[ref]
-					if !ok {
-						continue
-					}
-					childPath, err := urlkey.ModulePath(norm, child.Name)
-					if err != nil {
-						return nil, err
-					}
-					if _, present := g.Packages[childPath]; present {
-						continue
-					}
-					var childDeps []string
-					for _, d := range child.Deps {
-						if p2, err := urlkey.ModulePath(norm, d.InRepo); err == nil {
-							childDeps = append(childDeps, p2)
-						}
-					}
-					if err := g.add(Package{
-						Name: child.Name, Path: childPath, Repo: norm, Commit: commit, Tag: tagName, Tree: tree,
-						Dir: child.Dir, Routes: child.Modules, DeclaredRoutes: child.Modules,
-						Deps: childDeps, Kind: child.Kind, Entry: child.Entry,
-						Linker: child.Linker, Exclude: child.Exclude, Docs: child.Docs, Hooks: child.Hooks,
-					}, nil); err != nil {
-						return nil, err
-					}
-					changed = true
-				}
-			}
-		}
-
-		// A repository's own dependencies are enqueued once, never per package:
+		// A repository's dependencies are enqueued once, never per package:
 		// otherwise A->B->A grows the queue forever (review blocker).
-		if !expanded[key] {
-			expanded[key] = true
-			for _, p := range pt.Packages {
-				for _, d := range p.DepsFrom {
-					queue = append(queue, job{repo: d.Repo, tag: d.Tag, commit: d.Commit, libs: d.Libs, alias: d.Alias})
-				}
+		walkKey := norm + "@" + commit + "@" + dir
+		if !expanded[walkKey] {
+			expanded[walkKey] = true
+			for _, d := range pkgRefs(pt) {
+				queue = append(queue, job{repo: d.Repo, ref: d.Tag, commit: d.Commit})
 			}
 		}
 	}
@@ -310,8 +219,65 @@ func (r *Resolver) Resolve(cfg *manifest.File) (*Graph, error) {
 	return g, nil
 }
 
-// add registers a package, applies aliases and checks route conflicts (R1/R2).
-func (g *Graph) add(p Package, alias map[string]string) error {
+// checkPkgHooks rejects any phase a dependency may not declare: a library only
+// gets "vendor", which runs once against its store checkout (D84).
+func checkPkgHooks(h map[string][][]string) error {
+	phases := make([]string, 0, len(h))
+	for phase := range h {
+		phases = append(phases, phase)
+	}
+	sort.Strings(phases)
+	for _, phase := range phases {
+		if phase != "vendor" {
+			return fmt.Errorf("a dependency may only declare \"vendor\" hooks, got %q", phase)
+		}
+	}
+	return nil
+}
+
+func cmdDeps(pt *pkg.Tree) []pkg.DepFrom {
+	if pt.Cmd == nil {
+		return nil
+	}
+	return pt.Cmd.DepsFrom
+}
+
+// pkgRefs is every repository dependency a tree declares, library and command.
+func pkgRefs(pt *pkg.Tree) []pkg.DepFrom {
+	var refs []pkg.DepFrom
+	if pt.Pkg != nil {
+		refs = append(refs, pt.Pkg.DepsFrom...)
+	}
+	return append(refs, cmdDeps(pt)...)
+}
+
+// depPaths turns the declared repository dependencies of a package into module
+// paths.
+func depPaths(pt *pkg.Tree) ([]string, error) {
+	var refs []pkg.DepFrom
+	if pt.Pkg != nil {
+		refs = append(refs, pt.Pkg.DepsFrom...)
+	}
+	refs = append(refs, cmdDeps(pt)...)
+	var out []string
+	for _, d := range refs {
+		norm, err := urlkey.Normalize(d.Repo)
+		if err != nil {
+			return nil, err
+		}
+		mp, err := urlkey.ModulePath(norm)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, mp)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// add registers a package, applies the project's alias and checks route
+// conflicts (R1/R2).
+func (g *Graph) add(p Package, alias string) error {
 	if existing, ok := g.Packages[p.Path]; ok {
 		if existing.Repo == p.Repo && existing.Commit == p.Commit && existing.Dir == p.Dir {
 			return nil // already merged
@@ -320,9 +286,10 @@ func (g *Graph) add(p Package, alias map[string]string) error {
 			p.Path, existing.Repo, short(existing.Commit), p.Repo, short(p.Commit))
 	}
 	routes := []string{p.Path}
-	if a, ok := alias[p.Name]; ok && a != "" {
-		routes = []string{a}
-		p.Alias = a
+	if alias != "" {
+		routes = []string{alias}
+		p.Alias = alias
+		p.Routes = []string{alias}
 	}
 	g.Packages[p.Path] = &p
 
@@ -350,10 +317,14 @@ func (g *Graph) add(p Package, alias map[string]string) error {
 		}
 	}
 
-	g.Lock = append(g.Lock, LockEntry{
-		Name: p.Path, Repo: p.Repo, Tag: p.Tag, Commit: p.Commit,
-		Tree: "git-tree:" + p.Tree, Alias: alias[p.Name],
-	})
+	// A local dependency has no commit, so there is nothing to pin (D85). It is
+	// resolved from a working directory every time.
+	if p.Commit != "" {
+		g.Lock = append(g.Lock, LockEntry{
+			Name: p.Path, Repo: p.Repo, Tag: p.Tag, Commit: p.Commit,
+			Tree: "git-tree:" + p.Tree, Alias: p.Alias,
+		})
+	}
 	return nil
 }
 

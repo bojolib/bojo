@@ -2,18 +2,23 @@
 //
 // The vendor tree is flat and holds exactly one directory per module path:
 //
-//	.vendor/github/com/LukasLow/bojo_demo_pkg/cprint/__init__.mojo
+//	.vendor/gh/LukasLow/mojo_tls/__init__.mojo
 //
 // One path means one copy, so a package used by several dependents is compiled
 // once, and two providers of the same short name never meet. Nothing is
-// rewritten: the import path is the identity (D65/D66).
+// rewritten: the import path is the identity (D65/D66). The copy is the
+// committed tree (`git archive`), so `.gitattributes export-ignore` applies and
+// the result is reproducible from the lock alone (D73/D84).
 package vendor
 
 import (
+	"archive/tar"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
@@ -47,10 +52,20 @@ type Manifest struct {
 	Entries []Entry `json:"entries"`
 }
 
-// Roots are the module roots a build must pass to the compiler.
-func Roots(projectDir string) []string {
-	return []string{filepath.Join(projectDir, Dir)}
+// Modules is the extracted module root: what `-I` points at. It lives in the
+// cache, not in .vendor, so a build never reads from a directory that carries
+// build output (D87).
+func Modules(projectDir string) string {
+	return filepath.Join(projectDir, ".bojo", "cache", "mojo", "modules")
 }
+
+// TreePath is one package inside the module root.
+func TreePath(projectDir, modPath string) string {
+	return filepath.Join(Modules(projectDir), filepath.FromSlash(strings.ReplaceAll(modPath, ".", "/")))
+}
+
+// Roots are the module roots a build must pass to the compiler.
+func Roots(projectDir string) []string { return []string{Modules(projectDir)} }
 
 // Plan lists what Build would produce, without touching the disk.
 func Plan(g *resolve.Graph) (Manifest, error) {
@@ -146,11 +161,13 @@ func Build(projectDir string, g *resolve.Graph) (*Manifest, error) {
 
 		rel := strings.ReplaceAll(p.Path, ".", "/")
 		target := filepath.Join(tmp, filepath.FromSlash(rel))
-		if err := copyPackage(p.Dir, target, p.Exclude); err != nil {
-			return nil, fmt.Errorf("%s: %w", p.Path, err)
-		}
-		if err := renameModule(target, p.Name, p.Path); err != nil {
-			return nil, err
+		// D73/D84: the vendored tree is the committed tree, exactly. `git
+		// archive` therefore applies `.gitattributes export-ignore` for free and
+		// cannot pick up anything the working tree happens to contain.
+		if err := extractArchive(p.Dir, p.Commit, target, p.Exclude); err != nil {
+			if err := copyPackage(p.Dir, target, p.Exclude); err != nil {
+				return nil, fmt.Errorf("%s: %w", p.Path, err)
+			}
 		}
 
 		entries = append(entries, Entry{
@@ -168,11 +185,9 @@ func Build(projectDir string, g *resolve.Graph) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(filepath.Join(tmp, ManifestName), append(raw, '\n'), 0o644); err != nil {
-		return nil, err
-	}
-
-	final := filepath.Join(projectDir, Dir)
+	// The tree goes to the module root inside the cache (D87); .vendor keeps
+	// only the manifest that makes `vendor --check` possible.
+	final := Modules(projectDir)
 	old := final + ".old"
 	if err := os.RemoveAll(old); err != nil {
 		return nil, err
@@ -182,11 +197,22 @@ func Build(projectDir string, g *resolve.Graph) (*Manifest, error) {
 			return nil, err
 		}
 	}
+	if err := os.MkdirAll(filepath.Dir(final), 0o755); err != nil {
+		return nil, err
+	}
 	if err := os.Rename(tmp, final); err != nil {
 		_ = os.Rename(old, final)
 		return nil, err
 	}
 	_ = os.RemoveAll(old)
+
+	meta := filepath.Join(projectDir, Dir)
+	if err := os.MkdirAll(meta, 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(meta, ManifestName), append(raw, '\n'), 0o644); err != nil {
+		return nil, err
+	}
 	return &Manifest{Schema: 1, Entries: entries}, nil
 }
 
@@ -208,10 +234,79 @@ func writeAliases(root string, entries []Entry) error {
 	return nil
 }
 
+// extractArchive writes the committed tree of one repository into dst, using
+// `git archive` so `.gitattributes export-ignore` is honoured (D73). exclude
+// patterns are applied on top. A directory that is not a git checkout (or a
+// commit that is not there) returns an error, and the caller falls back to a
+// plain copy.
+func extractArchive(repoDir, commit, dst string, exclude []string) error {
+	if commit == "" {
+		return fmt.Errorf("no commit to archive")
+	}
+	cmd := exec.Command("git", "-C", repoDir, "archive", "--format=tar", commit)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	tr := tar.NewReader(stdout)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			_ = cmd.Wait()
+			return err
+		}
+		name := path.Clean(strings.TrimPrefix(hdr.Name, "./"))
+		if name == "." || name == "" || strings.HasPrefix(name, "..") {
+			continue
+		}
+		if matchesAny(name, exclude) {
+			continue
+		}
+		target := filepath.Join(dst, filepath.FromSlash(name))
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				_ = cmd.Wait()
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				_ = cmd.Wait()
+				return err
+			}
+			raw, err := io.ReadAll(tr)
+			if err != nil {
+				_ = cmd.Wait()
+				return err
+			}
+			if err := os.WriteFile(target, raw, 0o644); err != nil {
+				_ = cmd.Wait()
+				return err
+			}
+		}
+	}
+	return cmd.Wait()
+}
+
 func copyPackage(src, dst string, exclude []string) error {
 	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		// A local dependency can contain the project that copies it (a fixture
+		// inside the repository it tests). Never descend into the destination
+		// or into generated directories: the walk would copy itself forever.
+		if p != src && (d.IsDir() || d.Type()&fs.ModeSymlink != 0) {
+			clean := filepath.Clean(p)
+			if clean == dst || strings.HasPrefix(dst, clean+string(filepath.Separator)) {
+				return filepath.SkipDir
+			}
 		}
 		rel, err := filepath.Rel(src, p)
 		if err != nil {
@@ -220,7 +315,8 @@ func copyPackage(src, dst string, exclude []string) error {
 		if rel == "." {
 			return os.MkdirAll(dst, 0o755)
 		}
-		if d.IsDir() && (d.Name() == ".git" || d.Name() == "target") {
+		if d.IsDir() && (d.Name() == ".git" || d.Name() == "target" ||
+			d.Name() == ".bojo" || d.Name() == ".vendor" || d.Name() == ".out") {
 			return filepath.SkipDir
 		}
 		if matchesAny(filepath.ToSlash(rel), exclude) {
@@ -260,17 +356,5 @@ func matchesAny(rel string, patterns []string) bool {
 	return false
 }
 
-// renameModule writes the module path into the vendored manifest, so the copy
-// states under which name it is imported.
-func renameModule(dir, pkgName, modulePath string) error {
-	p := filepath.Join(dir, "bojo.pkg.toml")
-	raw, err := os.ReadFile(p)
-	if err != nil {
-		return nil // a package without a manifest is legal
-	}
-	out := strings.ReplaceAll(string(raw), `"`+pkgName+`"`, `"`+modulePath+`"`)
-	if out != string(raw) {
-		return os.WriteFile(p, []byte(out), 0o644)
-	}
-	return nil
-}
+// renameModule was removed with D83: the module path is the directory name, so
+// there is no declared package name left to rewrite.

@@ -108,10 +108,54 @@ func Normalize(raw string) (string, error) {
 	return scheme + "://" + host + path, nil
 }
 
+// Hosts maps a well-known host to its single import-path segment (D82). The
+// table is closed on purpose: an unknown host keeps its literal name instead of
+// inventing an abbreviation that could later collide with another host.
+var Hosts = map[string]string{
+	"github.com":   "gh",
+	"gitlab.com":   "gl",
+	"codeberg.org": "cb",
+	"git.sr.ht":    "sr",
+}
+
+// HostForPath returns the import-path segment for a host name.
+func HostForPath(host string) string {
+	h := strings.ToLower(host)
+	if short, ok := Hosts[h]; ok {
+		return short
+	}
+	return h
+}
+
+// Identifier turns a repository or owner name into a Mojo path segment (D83):
+// a dash is not legal in a Mojo identifier, so it becomes an underscore.
+func Identifier(name string) string {
+	return strings.ReplaceAll(name, "-", "_")
+}
+
+// RepoName returns the derived package name of a repository: its last path
+// segment as a Mojo identifier.
+func RepoName(raw string) (string, error) {
+	norm, err := Normalize(raw)
+	if err != nil {
+		return "", err
+	}
+	u, err := url.Parse(norm)
+	if err != nil {
+		return "", err
+	}
+	segments := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(segments) == 0 || segments[len(segments)-1] == "" {
+		return "", fmt.Errorf("%q has no repository name", raw)
+	}
+	return Identifier(segments[len(segments)-1]), nil
+}
+
 // Hash returns the 12-hex cache key for a normalised URL.
-// ModulePath is the import path of one package: host.owner.repo.package.
-// Mojo splits on dots, so the host becomes two directory levels on disk (D65).
-func ModulePath(normalized, pkgName string) (string, error) {
+// ModulePath is the import path of one package: <host>.<owner>.<repo>, where
+// <host> is the short alias from Hosts (D82) and the repository name is the
+// package name (D83).
+func ModulePath(normalized string) (string, error) {
 	u, err := url.Parse(normalized)
 	if err != nil {
 		return "", err
@@ -123,8 +167,14 @@ func ModulePath(normalized, pkgName string) (string, error) {
 	if repo == "" {
 		return "", fmt.Errorf("%q has no repository path", normalized)
 	}
-	parts := append([]string{u.Host}, strings.Split(repo, "/")...)
-	parts = append(parts, pkgName)
+	segments := strings.Split(repo, "/")
+	if len(segments) < 2 {
+		return "", fmt.Errorf("%q needs an owner and a repository", normalized)
+	}
+	parts := []string{HostForPath(u.Host)}
+	for _, s := range segments {
+		parts = append(parts, Identifier(s))
+	}
 	return strings.Join(parts, "."), nil
 }
 

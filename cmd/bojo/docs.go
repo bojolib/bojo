@@ -55,11 +55,11 @@ func cmdDocs(args []string) int {
 // ---------------------------------------------------------------------------
 // bojo remove <package>
 
-// cmdRemove deletes a package from its repository table and drops the table
-// when it becomes empty. Textual, so comments and order survive.
+// cmdRemove deletes a dependency by repository. A repository is its package, so
+// there is no package line to delete: the whole table goes (D83).
 func cmdRemove(args []string) int {
 	if len(args) != 1 {
-		fail(fmt.Errorf("usage: bojo remove <package>"))
+		fail(fmt.Errorf("usage: bojo remove <url>"))
 		return exitUsage
 	}
 	dir, err := projectRoot()
@@ -73,13 +73,9 @@ func cmdRemove(args []string) int {
 		fail(err)
 		return exitUsage
 	}
-	out, removed, err := removePackageLine(string(raw), args[0])
-	if err != nil {
-		fail(err)
-		return exitUsage
-	}
+	out, removed := removeRepoTable(string(raw), args[0])
 	if !removed {
-		fail(fmt.Errorf("no package %q in %s", args[0], path))
+		fail(fmt.Errorf("no dependency on %q in %s", args[0], path))
 		return exitUsage
 	}
 	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
@@ -90,62 +86,29 @@ func cmdRemove(args []string) int {
 	return exitOK
 }
 
-// removePackageLine walks the deps-from tables, deletes the line declaring the
-// package and removes the table header when nothing is left in it.
-func removePackageLine(text, pkg string) (string, bool, error) {
+// removeRepoTable drops `[deps-from."<url>"]` and its body. Textual, so
+// comments and order survive.
+func removeRepoTable(text, repo string) (string, bool) {
+	header := fmt.Sprintf("[deps-from.%q]", repo)
 	lines := strings.Split(text, "\n")
-	for i := 0; i < len(lines); i++ {
-		if !strings.HasPrefix(strings.TrimSpace(lines[i]), `[deps-from.`) {
+	for i, l := range lines {
+		if strings.TrimSpace(l) != header {
 			continue
 		}
-		// Find the table body.
 		end := len(lines)
 		for j := i + 1; j < len(lines); j++ {
-			t := strings.TrimSpace(lines[j])
-			if strings.HasPrefix(t, "[") {
+			if strings.HasPrefix(strings.TrimSpace(lines[j]), "[") {
 				end = j
 				break
 			}
 		}
-		removed := false
-		var body []string
-		for j := i + 1; j < end; j++ {
-			t := strings.TrimSpace(lines[j])
-			if t == "" || strings.HasPrefix(t, "#") {
-				body = append(body, lines[j])
-				continue
-			}
-			name := t
-			if eq := strings.IndexByte(t, '='); eq > 0 {
-				name = strings.TrimSpace(t[:eq])
-			}
-			if name == pkg {
-				removed = true
-				continue
-			}
-			body = append(body, lines[j])
+		rest := lines[end:]
+		if len(rest) > 0 && strings.TrimSpace(rest[0]) == "" {
+			rest = rest[1:]
 		}
-		if !removed {
-			i = end - 1
-			continue
-		}
-		// Drop trailing blank lines inside the body.
-		for len(body) > 0 && strings.TrimSpace(body[len(body)-1]) == "" {
-			body = body[:len(body)-1]
-		}
-		if len(body) == 0 {
-			// Empty table: remove the header and any blank line after it.
-			rest := lines[end:]
-			if len(rest) > 0 && strings.TrimSpace(rest[0]) == "" {
-				rest = rest[1:]
-			}
-			return strings.Join(append(append([]string{}, lines[:i]...), rest...), "\n"), true, nil
-		}
-		body = append(body, "")
-		rest := append(append([]string{}, body...), lines[end:]...)
-		return strings.Join(append(append([]string{}, lines[:i+1]...), rest...), "\n"), true, nil
+		return strings.Join(append(append([]string{}, lines[:i]...), rest...), "\n"), true
 	}
-	return text, false, nil
+	return text, false
 }
 
 // renderMarkdown is deliberately small: headings, fenced code, lists, inline

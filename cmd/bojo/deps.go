@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/LukasLow/bojo/internal/manifest"
+	"github.com/LukasLow/bojo/internal/urlkey"
 )
 
 // cmdDeps is the dependency front end (D50):
@@ -57,18 +58,18 @@ func depsList() int {
 		fmt.Println("no dependencies")
 		return exitOK
 	}
-	for repo, pkgs := range cfg.DepsFrom {
-		for name, spec := range pkgs {
-			ver := spec.Version
-			if ver == "" {
-				ver = "latest"
-			}
-			line := fmt.Sprintf("pkg    %s  %s  %s", name, repo, ver)
-			if spec.Alias != "" {
-				line += "  as " + spec.Alias
-			}
-			fmt.Println(line)
+	for repo, spec := range cfg.DepsFrom {
+		ver := spec.Version
+		if ver == "" {
+			ver = "latest"
 		}
+		name := repo
+		if norm, err := urlkey.Normalize(repo); err == nil {
+			if mp, err := urlkey.ModulePath(norm); err == nil {
+				name = mp
+			}
+		}
+		fmt.Printf("pkg    %s  %s  %s\n", name, repo, ver)
 	}
 	for name, d := range cfg.Deps.Local {
 		fmt.Printf("local  %s  %s\n", name, d.Path)

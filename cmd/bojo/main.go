@@ -129,7 +129,7 @@ Usage:
   bojo deps add-python <name>[@<ver>]
                                   add a Python package
   bojo update                     resolve and write bojo.lock
-  bojo build [--locked]           build into out/
+  bojo build [--locked]           build into .out/
   bojo run <url>#<pkg>@<ver>      ephemeral build and run a remote command
   bojo install <url>#<pkg>@<ver>  ephemeral build, binary to ~/.bojo/bin
   bojo tree                       print the resolved graph
@@ -140,7 +140,7 @@ Usage:
   bojo toolchain install <ver>    install a Mojo toolchain into ~/.bojo/mojo
   bojo toolchain list             list installed toolchains
   bojo cache list|clear           inspect or clear .bojo/cache
-  bojo clean [--all]              remove .bojo/ (--all: also out/)
+  bojo clean [--all]              remove .bojo/ (--all: also .out/ and .vendor/)
   bojo skill [claude|codex|opencode]
                                   print the agent skill as markdown
   bojo version                    print the version
@@ -322,7 +322,8 @@ strip  = true
 		}
 	}
 	ensureGitignore(dir, ".bojo/")
-	ensureGitignore(dir, "out/")
+	ensureGitignore(dir, ".out/")
+	ensureGitignore(dir, ".vendor/")
 
 	fmt.Printf("created bojo.toml in %s\n", dir)
 	fmt.Println("next: bojo build")
@@ -399,7 +400,14 @@ func cmdClean(args []string) int {
 			fail(err)
 			return exitUsage
 		} else if ok {
-			fmt.Println("removed out/")
+			fmt.Println("removed .out/")
+			removed++
+		}
+		if ok, err := removeIfExists(filepath.Join(dir, ".vendor")); err != nil {
+			fail(err)
+			return exitUsage
+		} else if ok {
+			fmt.Println("removed .vendor/")
 			removed++
 		}
 	}
@@ -453,10 +461,10 @@ func cmdCache(args []string) int {
 
 func cmdGet(args []string) int {
 	if len(args) == 0 {
-		fail(errors.New("usage: bojo get <url>#<pkg>@<version> [--as <name>]"))
+		fail(errors.New("usage: bojo get <url>@<version> [--as <name>]"))
 		return exitUsage
 	}
-	spec, err := parseSpec(args[0])
+	sp, err := parseSpec(args[0])
 	if err != nil {
 		fail(err)
 		return exitUsage
@@ -465,15 +473,6 @@ func cmdGet(args []string) int {
 	for i := 1; i < len(args); i++ {
 		if args[i] == "--as" && i+1 < len(args) {
 			aliasName = args[i+1]
-			i++
-			continue
-		}
-		if args[i] == "--lib" && i+1 < len(args) {
-			for _, l := range strings.Split(args[i+1], ",") {
-				if l = strings.TrimSpace(l); l != "" {
-					spec.pkgs = append(spec.pkgs, l)
-				}
-			}
 			i++
 			continue
 		}
@@ -491,45 +490,33 @@ func cmdGet(args []string) int {
 		fail(err)
 		return exitUsage
 	}
-	for repo, pkgs := range cfg.DepsFrom {
-		if repo != spec.repo {
-			continue
-		}
-		if existing, ok := pkgs[spec.pkg]; ok && existing.Version == spec.tag() {
-			fmt.Printf("already declared: %s@%s\n", spec.pkg, spec.version)
-			return exitOK
-		}
+	if existing, ok := cfg.DepsFrom[sp.repo]; ok && existing.Version == sp.tag() {
+		fmt.Printf("already declared: %s@%s\n", sp.repo, sp.version)
+		return exitOK
 	}
 
-	if spec.pkg != "" && len(spec.pkgs) == 0 {
-		spec.pkgs = []string{spec.pkg}
-	}
-	if len(spec.pkgs) == 0 {
-		fail(errors.New("which package? use <url>@<pkg>/<version> or --lib <pkg>"))
-		return exitUsage
-	}
-	if err := appendDepFrom(dir, spec, aliasName); err != nil {
+	if err := appendDepFrom(dir, sp, aliasName); err != nil {
 		fail(err)
 		return exitUsage
 	}
-	fmt.Printf("added %s@%s from %s\n", spec.pkg, spec.version, spec.repo)
-	printVendoredReadme(dir, spec.repo, spec.pkg)
+	fmt.Printf("added %s@%s\n", sp.repo, sp.version)
+	printVendoredReadme(dir, sp.repo)
 	fmt.Println("next: bojo update")
 	return exitOK
 }
 
 // printVendoredReadme shows what a package does right after it was added, but
 // only when the vendor tree already has it (D77).
-func printVendoredReadme(dir, repo, pkg string) {
+func printVendoredReadme(dir, repo string) {
 	norm, err := urlkey.Normalize(repo)
 	if err != nil {
 		return
 	}
-	modPath, err := urlkey.ModulePath(norm, pkg)
+	modPath, err := urlkey.ModulePath(norm)
 	if err != nil {
 		return
 	}
-	path := filepath.Join(dir, ".vendor", filepath.FromSlash(strings.ReplaceAll(modPath, ".", "/")), "README.md")
+	path := filepath.Join(vendor.TreePath(dir, modPath), "README.md")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -573,7 +560,19 @@ func cmdUpdate(args []string) int {
 	}
 	fmt.Printf("resolved %d package(s)\n", len(g.Packages))
 	if len(g.Hooks) > 0 {
-		fmt.Printf("%d hook(s) will need approval before they run\n", len(g.Hooks))
+		allow, err := hooks.Load(dir)
+		if err != nil {
+			fail(err)
+			return exitUsage
+		}
+		gated := allow.Filter(g.LockedCommits())
+		if code := gate(dir, gated, g); code != exitOK {
+			return code
+		}
+		if err := runVendorHooks(g, dir); err != nil {
+			fail(err)
+			return exitBuild
+		}
 	}
 	return exitOK
 }
@@ -605,8 +604,22 @@ func cmdVendor(args []string) int {
 		fmt.Println("ok: .vendor matches the graph")
 		return exitOK
 	}
+	// The trust gate comes before anything runs (D84): an unapproved vendor hook
+	// blocks the command with exit 2 and executes nothing.
+	allow, err := hooks.Load(dir)
+	if err != nil {
+		fail(err)
+		return exitUsage
+	}
+	if code := gate(dir, allow.Filter(g.LockedCommits()), g); code != exitOK {
+		return code
+	}
 	m, err := vendor.Build(dir, g)
 	if err != nil {
+		fail(err)
+		return exitBuild
+	}
+	if err := runVendorHooks(g, dir); err != nil {
 		fail(err)
 		return exitBuild
 	}
@@ -706,7 +719,7 @@ func cmdBuild(args []string) int {
 	}
 	modulesDir := ""
 	includes := append(vendor.Roots(dir), cfg.Build.Include...)
-	if err := runHooks(cfg, g, "pre-build", dir); err != nil {
+	if err := runProjectHooks(cfg, "pre-build", dir); err != nil {
 		fail(err)
 		return exitBuild
 	}
@@ -736,7 +749,7 @@ func cmdBuild(args []string) int {
 			return code
 		}
 	}
-	if err := runHooks(cfg, g, "post-build", dir); err != nil {
+	if err := runProjectHooks(cfg, "post-build", dir); err != nil {
 		fail(err)
 		return exitBuild
 	}
@@ -766,22 +779,9 @@ func compareLock(lf *lock.File, g *resolve.Graph) error {
 	return nil
 }
 
-// runHooks executes one phase. Foreign hooks run in the package directory (they
-// may write there, D33); the project's own hooks run in the project root.
-func runHooks(cfg *manifest.File, g *resolve.Graph, phase, projectDir string) error {
-	for _, r := range g.Hooks {
-		if r.Hook != phase {
-			continue
-		}
-		p := g.Packages[r.Pkg]
-		if p == nil {
-			continue
-		}
-		fmt.Printf("hook %s: %s (%s)\n", phase, strings.Join(r.Command, " "), r.Pkg)
-		if err := hooks.Run(r.Command, p.Dir); err != nil {
-			return fmt.Errorf("hook %q of %s failed: %w", phase, r.Pkg, err)
-		}
-	}
+// runProjectHooks runs the project's own hooks in the project root. A
+// dependency never contributes a build hook: its only phase is "vendor" (D84).
+func runProjectHooks(cfg *manifest.File, phase, projectDir string) error {
 	for _, c := range cfg.Hooks[phase] {
 		if len(c) == 0 {
 			continue
@@ -789,6 +789,26 @@ func runHooks(cfg *manifest.File, g *resolve.Graph, phase, projectDir string) er
 		fmt.Printf("own hook %s: %s\n", phase, strings.Join(c, " "))
 		if err := hooks.Run(c, projectDir); err != nil {
 			return fmt.Errorf("own hook %q failed: %w", phase, err)
+		}
+	}
+	return nil
+}
+
+// runVendorHooks runs the "vendor" phase of every dependency once, in its store
+// checkout — the original tree, not the vendored copy, so .vendor stays
+// source-only (D84).
+func runVendorHooks(g *resolve.Graph, projectDir string) error {
+	for _, r := range g.Hooks {
+		if r.Hook != "vendor" {
+			continue
+		}
+		p, ok := packageByShortName(g, r.Pkg)
+		if !ok {
+			continue
+		}
+		fmt.Printf("hook vendor: %s (%s)\n", strings.Join(r.Command, " "), r.Pkg)
+		if err := hooks.Run(r.Command, p.Dir); err != nil {
+			return fmt.Errorf("vendor hook of %s failed: %w", r.Pkg, err)
 		}
 	}
 	return nil
@@ -988,11 +1008,9 @@ name    = "ephemeral"
 version = "0.0.0"
 entry   = "main.mojo"
 
-[[deps-from]]
-repo = %q
-tag  = %q
-libs = [%q]
-`, spec.repo, spec.tag(), spec.pkg)
+[deps-from.%q]
+version = %q
+`, spec.repo, spec.tag())
 	if err := os.WriteFile(filepath.Join(tmp, "bojo.toml"), []byte(cfgText), 0o644); err != nil {
 		fail(err)
 		return exitUsage
@@ -1011,15 +1029,20 @@ libs = [%q]
 		return resolveExit(err)
 	}
 
-	p, ok := packageByShortName(g, spec.pkg)
+	norm, err := urlkey.Normalize(spec.repo)
+	if err != nil {
+		fail(err)
+		return exitUsage
+	}
+	// The command belongs to the repository, not to a package: a repository
+	// that ships only a [cmd] is runnable too (D83).
+	p, ok := g.Commands[norm]
 	if !ok {
-		fail(fmt.Errorf("package %q not found", spec.pkg))
+		fail(fmt.Errorf("%s has no [cmd]; `run` and `install` need one", spec.repo))
 		return exitUsage
 	}
-	if p.Kind != "cmd" {
-		fail(fmt.Errorf("package %q is a library; only kind = \"cmd\" packages can be run or installed", spec.pkg))
-		return exitUsage
-	}
+	name := p.Name
+	entry := filepath.Join(p.Dir, filepath.FromSlash(p.Entry))
 
 	// The approval store belongs to the invoking project, not to the temporary
 	// build directory: otherwise a hook could never be approved at all.
@@ -1041,13 +1064,16 @@ libs = [%q]
 		fail(err)
 		return exitUsage
 	}
+	if err := runVendorHooks(g, tmp); err != nil {
+		fail(err)
+		return exitBuild
+	}
 	modulesDir := ""
 	if err != nil {
 		fail(err)
 		return exitBuild
 	}
-	entry := filepath.Join(p.Dir, p.Entry)
-	out := filepath.Join(tmp, ".out", spec.pkg)
+	out := filepath.Join(tmp, ".out", name)
 	version := ""
 	if cwdCfg, cerr := manifest.Load(cwd); cerr == nil {
 		version = cwdCfg.Version.Mojo
@@ -1068,7 +1094,7 @@ libs = [%q]
 			fail(err)
 			return exitUsage
 		}
-		dest := filepath.Join(binDir, spec.pkg)
+		dest := filepath.Join(binDir, name)
 		if _, err := os.Stat(dest); err == nil && !force {
 			fail(fmt.Errorf("%s already exists; pass --force to overwrite", dest))
 			return exitUsage
@@ -1131,36 +1157,27 @@ func resolveProject() (string, *resolve.Graph, int) {
 }
 
 type spec struct {
-	repo, pkg, version string
-	pkgs               []string
+	repo, version string
 }
 
-// tag is what the manifest stores: one version per repository (D74).
+// tag is what the manifest stores: one version per repository (D83).
 func (s spec) tag() string { return "v" + strings.TrimPrefix(s.version, "v") }
 
-// libs is the package selection; --lib may name several.
-func (s spec) libs() []string { return s.pkgs }
-
-// pkgTag is the tag that names the package and its version (D79).
-func (s spec) pkgTag() string { return s.pkg + "@" + s.tag() }
-
-// parseSpec splits `url#pkg@version` (D80): the URL is the address, the
-// fragment selects the package and its version.
+// parseSpec splits `url@version` (D83): a repository is its package, so no
+// fragment is needed to select one.
 func parseSpec(raw string) (spec, error) {
-	hash := strings.LastIndex(raw, "#")
-	if hash < 0 {
-		return spec{}, fmt.Errorf("%q is missing #<pkg>@<version> (example: https://github.com/owner/repo#pkg@v0.0.1)", raw)
+	if strings.Contains(raw, "#") {
+		return spec{}, fmt.Errorf("%q uses #<pkg>; a repository provides at most one library, so write <url>@<version>", raw)
 	}
-	repo, rest := raw[:hash], raw[hash+1:]
-	at := strings.LastIndex(rest, "@")
-	if at < 0 {
-		return spec{}, fmt.Errorf("%q is missing @<version>", raw)
+	at := strings.LastIndex(raw, "@")
+	if at <= 0 {
+		return spec{}, fmt.Errorf("%q is missing @<version> (example: https://github.com/owner/repo@v0.1.0)", raw)
 	}
-	pkgName, ver := rest[:at], rest[at+1:]
-	if repo == "" || pkgName == "" || ver == "" {
+	repo, ver := raw[:at], raw[at+1:]
+	if repo == "" || ver == "" {
 		return spec{}, fmt.Errorf("%q is not a valid package reference", raw)
 	}
-	return spec{repo: repo, pkg: pkgName, version: ver}, nil
+	return spec{repo: repo, version: ver}, nil
 }
 
 func writeLock(dir, mojoFingerprint string, g *resolve.Graph) error {
@@ -1252,28 +1269,40 @@ func appendDepFrom(dir string, sp spec, alias string) error {
 		return err
 	}
 	header := fmt.Sprintf("[deps-from.%q]", sp.repo)
-	line := fmt.Sprintf("%q = %q", sp.pkg, sp.tag())
-	if alias != "" {
-		line = fmt.Sprintf("%q = { version = %q, as = %q }", sp.pkg, sp.tag(), alias)
-	}
-	if updated, found, err := insertIntoTable(string(raw), header, sp.pkg, line); err != nil {
+	line := fmt.Sprintf("version = %q", sp.tag())
+	if updated, found, err := insertIntoTable(string(raw), header, "version", line); err != nil {
 		return err
 	} else if found {
-		return os.WriteFile(path, []byte(updated), 0o644)
+		raw = []byte(updated)
+	} else {
+		var b strings.Builder
+		if !strings.HasSuffix(string(raw), "\n") {
+			b.WriteString("\n")
+		}
+		b.WriteString("\n" + header + "\n")
+		b.WriteString(line + "\n")
+		raw = append(raw, b.String()...)
 	}
-	var b strings.Builder
-	if !strings.HasSuffix(string(raw), "\n") {
-		b.WriteString("\n")
+	if alias != "" {
+		norm, err := urlkey.Normalize(sp.repo)
+		if err != nil {
+			return err
+		}
+		modPath, err := urlkey.ModulePath(norm)
+		if err != nil {
+			return err
+		}
+		aliasHeader := "[alias]"
+		aliasLine := fmt.Sprintf("%q = %q", modPath, alias)
+		if updated, found, err := insertIntoTable(string(raw), aliasHeader, modPath, aliasLine); err != nil {
+			return err
+		} else if found {
+			raw = []byte(updated)
+		} else {
+			raw = append(raw, []byte("\n"+aliasHeader+"\n"+aliasLine+"\n")...)
+		}
 	}
-	b.WriteString("\n" + header + "\n")
-	b.WriteString(line)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = f.WriteString(b.String())
-	return err
+	return os.WriteFile(path, raw, 0o644)
 }
 
 func sortedNames(g *resolve.Graph) []string {

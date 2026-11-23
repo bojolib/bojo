@@ -3,7 +3,7 @@ package tag
 import "testing"
 
 func TestParseAndCompare(t *testing.T) {
-	a, err := ParseTag("addition/v0.0.1", "addition")
+	a, err := ParseVersion("v0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -11,7 +11,7 @@ func TestParseAndCompare(t *testing.T) {
 		t.Fatalf("String() = %q", a.String())
 	}
 
-	b, err := ParseTag("addition/v0.0.10", "addition")
+	b, err := ParseVersion("v0.0.10")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,72 +32,64 @@ func TestParseAndCompare(t *testing.T) {
 	}
 }
 
-func TestParseTagRejectsForeignTags(t *testing.T) {
+func TestParseVersionRejectsNonVersions(t *testing.T) {
 	for _, raw := range []string{
-		"v0.0.1",                // no package prefix
-		"hello/v0.0.1",          // other package
-		"addition/sub/v0.0.1",   // two slashes
-		"addition/v0.0",         // not semver
-		"addition/0.0.1",        // no leading v
-		"addition/v0.0.1/extra", // extra segment
+		"hello/v0.0.1",      // a package tag is not a repository version
+		"addition@v0.0.1",   // neither is the @ form
+		"v0.0",              // not semver
+		"0.0.1",             // no leading v
+		"addition/v0.0.1/x", // extra segment
+		"",                  // empty
 	} {
-		if _, err := ParseTag(raw, "addition"); err == nil {
-			t.Errorf("ParseTag(%q) should fail", raw)
+		if _, err := ParseVersion(raw); err == nil {
+			t.Errorf("ParseVersion(%q) should fail", raw)
 		}
 	}
 }
 
-func TestLatestAcceptsRepositoryWideTags(t *testing.T) {
-	// One version per repository (D74): a plain vX.Y.Z tag applies to every
-	// package, a <pkg>/vX.Y.Z tag still names one package.
+func TestLatestIgnoresPackageTags(t *testing.T) {
+	// One repository is one package (D83): only plain vX.Y.Z tags count. A
+	// prefixed tag is ignored, because it would be ambiguous.
 	tags := []string{
 		"hello/v5.0.0",
 		"addition/v0.0.1",
-		"addition/v0.0.3",
+		"v0.0.3",
 		"addition/v0.0.2",
 	}
-	got, err := Latest("addition", tags)
+	got, err := Latest(tags)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.String() != "v0.0.3" {
 		t.Fatalf("Latest = %q, want v0.0.3", got.String())
 	}
-
-	got, err = Latest("addition", []string{"v9.9.9", "addition/v0.0.1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.String() != "v9.9.9" {
-		t.Fatalf("repository-wide tag must win: got %q", got.String())
-	}
 }
 
 func TestFindReturnsTheTagThatWasUsed(t *testing.T) {
-	if name, v, err := Find("addition", "v0.0.2", []string{"v0.0.1", "v0.0.2"}); err != nil || name != "v0.0.2" || v.String() != "v0.0.2" {
+	if name, v, err := Find("v0.0.2", []string{"v0.0.1", "v0.0.2"}); err != nil || name != "v0.0.2" || v.String() != "v0.0.2" {
 		t.Fatalf("repo-wide: %q %v %v", name, v, err)
 	}
-	if name, _, err := Find("addition", "0.0.1", []string{"addition/v0.0.1"}); err != nil || name != "addition/v0.0.1" {
-		t.Fatalf("package tag: %q %v", name, err)
+	if _, _, err := Find("0.0.1", []string{"addition/v0.0.1"}); err == nil {
+		t.Fatal("a package tag must not satisfy a repository version")
 	}
 }
 
 func TestMatch(t *testing.T) {
-	tags := []string{"addition/v0.0.1", "addition/v0.0.2"}
+	tags := []string{"v0.0.1", "v0.0.2", "addition/v9.9.9"}
 
-	if v, err := Match("addition", "latest", tags); err != nil || v.String() != "v0.0.2" {
+	if v, err := Match("latest", tags); err != nil || v.String() != "v0.0.2" {
 		t.Fatalf("latest: %v %v", v, err)
 	}
-	if v, err := Match("addition", "v0.0.1", tags); err != nil || v.String() != "v0.0.1" {
+	if v, err := Match("v0.0.1", tags); err != nil || v.String() != "v0.0.1" {
 		t.Fatalf("exact with v: %v %v", v, err)
 	}
-	if v, err := Match("addition", "0.0.1", tags); err != nil || v.String() != "v0.0.1" {
+	if v, err := Match("0.0.1", tags); err != nil || v.String() != "v0.0.1" {
 		t.Fatalf("exact without v: %v %v", v, err)
 	}
-	if _, err := Match("addition", "v0.0.9", tags); err == nil {
+	if _, err := Match("v0.0.9", tags); err == nil {
 		t.Fatal("unknown version should fail")
 	}
-	if _, err := Match("addition", "main", tags); err == nil {
+	if _, err := Match("main", tags); err == nil {
 		t.Fatal("a branch ref must be rejected")
 	}
 }
