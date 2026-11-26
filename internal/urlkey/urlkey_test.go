@@ -111,8 +111,8 @@ func TestHashIsStableAndTwelveHex(t *testing.T) {
 
 func TestModulePath(t *testing.T) {
 	cases := []struct{ repo, want string }{
-		{"https://github.com/LukasLow/bojo_demo_pkg", "gh.LukasLow.bojo_demo_pkg"},
-		{"https://github.com/LukasLow/bojo_demo_pkg.git", "gh.LukasLow.bojo_demo_pkg"},
+		{"https://github.com/bojolib/bojo_demo_pkg", "gh.bojolib.bojo_demo_pkg"},
+		{"https://github.com/bojolib/bojo_demo_pkg.git", "gh.bojolib.bojo_demo_pkg"},
 		{"https://gitlab.com/a/b/c", "gl.a.b.c"},
 		{"https://codeberg.org/lukas/mojo-tls", "cb.lukas.mojo_tls"},
 		// An unknown host keeps its literal name: no invented abbreviation (D82).
@@ -146,6 +146,77 @@ func TestHostForPath(t *testing.T) {
 	for host, want := range cases {
 		if got := HostForPath(host); got != want {
 			t.Errorf("HostForPath(%q) = %q, want %q", host, got, want)
+		}
+	}
+}
+
+func TestVersionedModulePath(t *testing.T) {
+	norm := "https://github.com/bojolib/socket"
+	cases := []struct {
+		major int
+		want  string
+	}{
+		{0, "gh.bojolib.socket"},
+		{1, "gh.bojolib.socket"},
+		{2, "v2.gh.bojolib.socket"},
+		{3, "v3.gh.bojolib.socket"},
+		{10, "v10.gh.bojolib.socket"},
+	}
+	for _, tc := range cases {
+		got, err := VersionedModulePath(norm, tc.major)
+		if err != nil {
+			t.Fatalf("VersionedModulePath(%d): %v", tc.major, err)
+		}
+		if got != tc.want {
+			t.Errorf("VersionedModulePath(%d) = %q, want %q", tc.major, got, tc.want)
+		}
+	}
+}
+
+func TestParseModulePath(t *testing.T) {
+	cases := []struct {
+		in        string
+		wantMajor int
+		wantBase  string
+	}{
+		{"gh.bojolib.socket", 0, "gh.bojolib.socket"},
+		{"v2.gh.bojolib.socket", 2, "gh.bojolib.socket"},
+		{"v10.gl.org.sub.pkg", 10, "gl.org.sub.pkg"},
+		{"v1.gh.bojolib.socket", 0, "v1.gh.bojolib.socket"},
+		{"v0.gh.bojolib.socket", 0, "v0.gh.bojolib.socket"},
+		{"v02.gh.bojolib.socket", 0, "v02.gh.bojolib.socket"},
+		{"v2x.gh.bojolib.socket", 0, "v2x.gh.bojolib.socket"},
+		{"v2", 0, "v2"},
+		{"v2.", 0, "v2."},
+	}
+	for _, tc := range cases {
+		major, base := ParseModulePath(tc.in)
+		if major != tc.wantMajor || base != tc.wantBase {
+			t.Errorf("ParseModulePath(%q) = (%d, %q), want (%d, %q)",
+				tc.in, major, base, tc.wantMajor, tc.wantBase)
+		}
+	}
+}
+
+func TestSplitDepKey(t *testing.T) {
+	cases := []struct {
+		in        string
+		wantRepo  string
+		wantMajor int
+	}{
+		{"https://github.com/bojolib/socket", "https://github.com/bojolib/socket", 0},
+		{"https://github.com/bojolib/socket@v2", "https://github.com/bojolib/socket", 2},
+		{"https://github.com/bojolib/socket@v1", "https://github.com/bojolib/socket", 1},
+		{"https://github.com/bojolib/socket@v10", "https://github.com/bojolib/socket", 10},
+		{"git@github.com:bojolib/socket", "git@github.com:bojolib/socket", 0},
+		{"git@github.com:bojolib/socket@v2", "git@github.com:bojolib/socket", 2},
+		{"https://github.com/bojolib/socket@main", "https://github.com/bojolib/socket@main", 0},
+	}
+	for _, tc := range cases {
+		repo, major := SplitDepKey(tc.in)
+		if repo != tc.wantRepo || major != tc.wantMajor {
+			t.Errorf("SplitDepKey(%q) = (%q, %d), want (%q, %d)",
+				tc.in, repo, major, tc.wantRepo, tc.wantMajor)
 		}
 	}
 }

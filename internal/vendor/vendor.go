@@ -2,7 +2,7 @@
 //
 // The vendor tree is flat and holds exactly one directory per module path:
 //
-//	.vendor/gh/LukasLow/mojo_tls/__init__.mojo
+//	.vendor/gh/bojolib/mojo_tls/__init__.mojo
 //
 // One path means one copy, so a package used by several dependents is compiled
 // once, and two providers of the same short name never meet. Nothing is
@@ -24,7 +24,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/LukasLow/bojo/internal/resolve"
+	"github.com/bojolib/bojo/internal/resolve"
 )
 
 const (

@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/LukasLow/bojo/internal/manifest"
-	"github.com/LukasLow/bojo/internal/resolve"
-	"github.com/LukasLow/bojo/internal/toolchain"
+	"github.com/bojolib/bojo/internal/manifest"
+	"github.com/bojolib/bojo/internal/resolve"
+	"github.com/bojolib/bojo/internal/toolchain"
 )
 
 // ---------------------------------------------------------------------------
@@ -25,7 +25,10 @@ func cmdDocs(args []string) int {
 	if code != exitOK {
 		return code
 	}
-	p, ok := packageByShortName(g, args[0])
+	p, ok := g.Packages[args[0]]
+	if !ok {
+		p, ok = packageByShortName(g, args[0])
+	}
 	if !ok {
 		fail(fmt.Errorf("no package %q in the graph", args[0]))
 		return exitUsage
@@ -35,6 +38,17 @@ func cmdDocs(args []string) int {
 	rel := "index.md"
 	if len(args) > 1 {
 		rel = args[1]
+	}
+	if strings.EqualFold(rel, "api") || strings.EqualFold(rel, "API.md") {
+		apiPath := filepath.Join(p.Dir, "API.md")
+		raw, err := os.ReadFile(apiPath)
+		if err != nil {
+			fail(fmt.Errorf("no API.md in %s (looked in %s)", args[0], apiPath))
+			return exitUsage
+		}
+		_ = dir
+		fmt.Print(renderMarkdown(string(raw)))
+		return exitOK
 	}
 	clean := filepath.Clean(rel)
 	if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {

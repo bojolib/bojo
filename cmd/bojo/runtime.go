@@ -5,30 +5,19 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/LukasLow/bojo/internal/resolve"
+	"github.com/bojolib/bojo/internal/resolve"
+	"github.com/bojolib/bojo/internal/vendor"
 )
 
 // bundleRuntimeFiles copies every file a package declared as `runtime` into
 // `<out>/data/<pkg>/…`. The launcher points BOJO_DATA at that directory, so a
 // package can read its data without knowing where it was installed (D60).
 func bundleRuntimeFiles(dir string, g *resolve.Graph, outDir string) error {
-	pkgs := filepath.Join(dir, "vendor", "mojo", "pkgs")
-	subpkgs := filepath.Join(dir, "vendor", "mojo", "subpkgs")
 	for _, p := range g.Packages {
 		if len(p.Linker.Runtime) == 0 {
 			continue
 		}
-		root := p.Name
-		if len(p.Routes) > 0 {
-			root = p.Routes[0]
-		}
-		src0 := filepath.Join(pkgs, root)
-		if _, err := os.Stat(src0); err != nil {
-			matches, _ := filepath.Glob(filepath.Join(subpkgs, root+"_*"))
-			if len(matches) == 1 {
-				src0 = matches[0]
-			}
-		}
+		src0 := vendor.TreePath(dir, p.Path)
 		for _, entry := range p.Linker.Runtime {
 			src := filepath.Join(src0, entry)
 			dst := filepath.Join(outDir, "data", p.Name, entry)

@@ -12,8 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/LukasLow/bojo/internal/tag"
-	"github.com/LukasLow/bojo/internal/urlkey"
+	"github.com/bojolib/bojo/internal/tag"
+	"github.com/bojolib/bojo/internal/urlkey"
 )
 
 // FetchError marks a failure that came from talking to the remote (network,

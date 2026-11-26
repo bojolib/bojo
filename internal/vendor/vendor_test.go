@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/LukasLow/bojo/internal/resolve"
+	"github.com/bojolib/bojo/internal/resolve"
 )
 
 func pkgDir(t *testing.T, root, name, body string) string {
@@ -58,8 +58,8 @@ func TestBuildGeneratesAliasShim(t *testing.T) {
 	dir := pkgDir(t, src, "addition", "def add(a: Int, b: Int) -> Int:\n    return a + b\n")
 
 	g := &resolve.Graph{Packages: map[string]*resolve.Package{
-		"gh.LukasLow.mojo_addition": {
-			Name: "mojo_addition", Path: "gh.LukasLow.mojo_addition",
+		"gh.bojolib.mojo_addition": {
+			Name: "mojo_addition", Path: "gh.bojolib.mojo_addition",
 			Dir: dir, Commit: strings.Repeat("c", 40), Alias: "mathx",
 		},
 	}}
@@ -72,7 +72,7 @@ func TestBuildGeneratesAliasShim(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := string(raw)
-	if !strings.Contains(got, "from gh.LukasLow.mojo_addition import *") {
+	if !strings.Contains(got, "from gh.bojolib.mojo_addition import *") {
 		t.Fatalf("shim does not re-export the full path:\n%s", got)
 	}
 }
@@ -175,5 +175,42 @@ func TestBuildHonoursExclude(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(Modules(project), "gh/X/mojo_http/__init__.mojo")); err != nil {
 		t.Fatalf("package body must be copied: %v", err)
+	}
+}
+
+func TestBuildCoexistsV1AndV2ModulePaths(t *testing.T) {
+	src := t.TempDir()
+	project := t.TempDir()
+	v1Dir := pkgDir(t, src, "v1", "def ver() -> Int:\n    return 1\n")
+	v2Dir := pkgDir(t, src, "v2", "def ver() -> Int:\n    return 2\n")
+
+	g := &resolve.Graph{Packages: map[string]*resolve.Package{
+		"gh.bojolib.socket": {
+			Name: "socket", Path: "gh.bojolib.socket", Dir: v1Dir,
+			Commit: strings.Repeat("1", 40),
+		},
+		"v2.gh.bojolib.socket": {
+			Name: "socket", Path: "v2.gh.bojolib.socket", Dir: v2Dir,
+			Commit: strings.Repeat("2", 40), Alias: "socket",
+		},
+	}}
+	if _, err := Build(project, g); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{
+		"gh/bojolib/socket/__init__.mojo",
+		"v2/gh/bojolib/socket/__init__.mojo",
+		"socket/__init__.mojo",
+	} {
+		if _, err := os.Stat(filepath.Join(Modules(project), filepath.FromSlash(rel))); err != nil {
+			t.Errorf("missing %s: %v", rel, err)
+		}
+	}
+	shim, err := os.ReadFile(filepath.Join(Modules(project), "socket/__init__.mojo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(shim), "from v2.gh.bojolib.socket import *") {
+		t.Fatalf("v2 alias shim mismatch:\n%s", shim)
 	}
 }

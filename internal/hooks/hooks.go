@@ -135,12 +135,14 @@ func equalArgs(a, b []string) bool {
 	return true
 }
 
-// Filter returns a store containing only entries whose commit is the one pinned
-// in the lock. Anything else is stale and must not authorise a run (D28).
-func (s *Store) Filter(locked map[string]string) *Store {
+// Filter returns a store containing only entries whose (repo, commit) pair is
+// pinned in the lock (`"<repo>@<commit>"` -> true). Anything else is stale and
+// must not authorise a run (D28). Keying by repo+commit lets v1 and v2 of the
+// same repository coexist cleanly.
+func (s *Store) Filter(locked map[string]bool) *Store {
 	out := &Store{Path: s.Path, byID: map[string]Entry{}}
 	for _, e := range s.Entries {
-		if locked[e.Repo] == e.Commit {
+		if locked[e.Repo+"@"+e.Commit] {
 			out.Entries = append(out.Entries, e)
 			out.byID[e.ID()] = e
 		}
@@ -148,12 +150,12 @@ func (s *Store) Filter(locked map[string]string) *Store {
 	return out
 }
 
-// Stale returns entries whose (repo, commit) is not part of the current lock.
-// Such lines are ignored and reported (D28).
-func (s *Store) Stale(locked map[string]string) []Entry {
+// Stale returns entries whose (repo, commit) pair is not part of the current
+// lock (`"<repo>@<commit>"` -> true). Such lines are ignored and reported (D28).
+func (s *Store) Stale(locked map[string]bool) []Entry {
 	var out []Entry
 	for _, e := range s.Entries {
-		if locked[e.Repo] != e.Commit {
+		if !locked[e.Repo+"@"+e.Commit] {
 			out = append(out, e)
 		}
 	}

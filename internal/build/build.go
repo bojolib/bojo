@@ -13,7 +13,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/LukasLow/bojo/internal/resolve"
+	"github.com/bojolib/bojo/internal/resolve"
 )
 
 // Materialize builds `.bojo/modules` from the resolved routes.

@@ -14,11 +14,12 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"github.com/LukasLow/bojo/internal/manifest"
-	"github.com/LukasLow/bojo/internal/pkg"
-	"github.com/LukasLow/bojo/internal/toolchain"
-	"github.com/LukasLow/bojo/internal/urlkey"
-	"github.com/LukasLow/bojo/internal/vendor"
+	"github.com/bojolib/bojo/internal/manifest"
+	"github.com/bojolib/bojo/internal/pkg"
+	"github.com/bojolib/bojo/internal/tag"
+	"github.com/bojolib/bojo/internal/toolchain"
+	"github.com/bojolib/bojo/internal/urlkey"
+	"github.com/bojolib/bojo/internal/vendor"
 )
 
 // ---------------------------------------------------------------------------
@@ -160,17 +161,28 @@ func indexRepo(norm, raw, sha, version string, follow bool, depth int) ([]indexE
 	if err != nil {
 		return nil, err
 	}
-	modPath, err := urlkey.ModulePath(norm)
+	modPath, err := urlkey.VersionedModulePath(norm, tag.MajorOf(version))
 	if err != nil {
 		return nil, err
 	}
+	depKeys := make([]string, 0, len(f.Pkg.DepsFrom))
+	for k := range f.Pkg.DepsFrom {
+		depKeys = append(depKeys, k)
+	}
+	sort.Strings(depKeys)
 	var deps []string
-	for _, d := range f.Pkg.DepsFrom {
-		dn, err := urlkey.Normalize(d.Repo)
+	for _, rawKey := range depKeys {
+		d := f.Pkg.DepsFrom[rawKey]
+		repoRaw, majorHint := urlkey.SplitDepKey(rawKey)
+		dn, err := urlkey.Normalize(repoRaw)
 		if err != nil {
 			continue
 		}
-		if mp, err := urlkey.ModulePath(dn); err == nil {
+		major := tag.MajorOf(d.Version)
+		if major == 0 {
+			major = majorHint
+		}
+		if mp, err := urlkey.VersionedModulePath(dn, major); err == nil {
 			deps = append(deps, mp)
 		}
 	}
@@ -184,21 +196,29 @@ func indexRepo(norm, raw, sha, version string, follow bool, depth int) ([]indexE
 	}}
 	if follow && depth < 1 {
 		seen := map[string]bool{}
-		for _, d := range f.Pkg.DepsFrom {
-			dn, err := urlkey.Normalize(d.Repo)
-			if err != nil || seen[dn] {
-				continue
-			}
-			seen[dn] = true
-			base, ver := "HEAD", "unreleased"
-			if d.Tag != "" {
-				base, ver = d.Tag, d.Tag
-			}
-			subSHA, err := refSHA(d.Repo, base)
+		for _, rawKey := range depKeys {
+			d := f.Pkg.DepsFrom[rawKey]
+			repoRaw, _ := urlkey.SplitDepKey(rawKey)
+			dn, err := urlkey.Normalize(repoRaw)
 			if err != nil {
 				continue
 			}
-			nested, err := indexRepo(dn, d.Repo, subSHA, ver, false, depth+1)
+			base, ver := "HEAD", "unreleased"
+			if d.Version != "" {
+				base, ver = d.Version, d.Version
+			} else if d.Commit != "" {
+				base, ver = d.Commit, d.Commit
+			}
+			seenKey := dn + "@" + ver
+			if seen[seenKey] {
+				continue
+			}
+			seen[seenKey] = true
+			subSHA, err := refSHA(repoRaw, base)
+			if err != nil {
+				continue
+			}
+			nested, err := indexRepo(dn, repoRaw, subSHA, ver, false, depth+1)
 			if err != nil {
 				continue
 			}
@@ -234,30 +254,25 @@ func refSHA(raw, ref string) (string, error) {
 	return "", fmt.Errorf("cannot resolve %q in %s", ref, raw)
 }
 
-// latestTag asks the remote for its tags; no clone.
+// latestTag asks the remote for its highest semantic version tag; no clone.
 func latestTag(raw string) (string, error) {
 	out, err := exec.Command("git", "ls-remote", "--tags", "--refs", raw).Output()
 	if err != nil {
 		return "", fmt.Errorf("listing tags of %s: %w", raw, err)
 	}
-	var best string
+	var tags []string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) != 2 {
 			continue
 		}
-		tag := strings.TrimPrefix(fields[1], "refs/tags/")
-		if strings.Contains(tag, "/") {
-			continue // a per-package tag is not a repository version
-		}
-		if best == "" || tag > best {
-			best = tag
-		}
+		tags = append(tags, strings.TrimPrefix(fields[1], "refs/tags/"))
 	}
-	if best == "" {
-		return "", fmt.Errorf("%s has no tags", raw)
+	v, err := tag.Latest(tags)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", raw, err)
 	}
-	return best, nil
+	return v.Raw, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -340,7 +355,7 @@ func cmdSearch(args []string) int {
 		if h.Description != "" {
 			fmt.Printf("  %s\n", h.Description)
 		}
-		fmt.Printf("  bojo get %s@%s --lib %s\n", repoOf(h.Path), h.Version, lastSegment(h.Path))
+		fmt.Printf("  bojo get %s@%s\n", repoOf(h.Path), h.Version)
 	}
 	if len(hits) == 0 {
 		fmt.Printf("no match for %q in %s\n", term, path)
@@ -349,18 +364,21 @@ func cmdSearch(args []string) int {
 }
 
 func repoOf(modulePath string) string {
-	parts := strings.Split(modulePath, ".")
-	if len(parts) < 4 {
+	_, base := urlkey.ParseModulePath(modulePath)
+	parts := strings.Split(base, ".")
+	if len(parts) < 3 {
 		return modulePath
 	}
-	return "https://" + strings.Join(parts[:len(parts)-1], "/")
-}
-
-func lastSegment(modulePath string) string {
-	if i := strings.LastIndexByte(modulePath, '.'); i >= 0 {
-		return modulePath[i+1:]
+	host := parts[0]
+	for full, short := range urlkey.Hosts {
+		if short == host {
+			return "https://" + full + "/" + strings.Join(parts[1:], "/")
+		}
 	}
-	return modulePath
+	if len(parts) < 4 {
+		return "https://" + strings.Join(parts, "/")
+	}
+	return "https://" + strings.Join(parts[:len(parts)-2], ".") + "/" + strings.Join(parts[len(parts)-2:], "/")
 }
 
 // ---------------------------------------------------------------------------

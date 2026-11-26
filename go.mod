@@ -1,4 +1,4 @@
-module github.com/LukasLow/bojo
+module github.com/bojolib/bojo
 
 go 1.24
 

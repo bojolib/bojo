@@ -11,10 +11,10 @@ Status: round 3. Normative. Any semantic change requires a decision in §16
 bojo is a package manager and build driver for Mojo:
 
 ```
-bojo get     <url>#<pkg>@<version>   add a dependency
+bojo get     <url>@<version>         add a library dependency
 bojo build                           build the project
-bojo run     <url>#<pkg>@<version>   build and run a remote command
-bojo install <url>#<pkg>@<version>   install a command globally
+bojo run     <url>@<version>         build and run a remote command
+bojo install <url>@<version>         install a command globally
 ```
 
 Core idea: **a library author declares in one place what is needed to build and
@@ -60,26 +60,39 @@ not as static linking: 26.4 MB / 10 ms, stripped 5.29 MB / 4–5 ms (§18).
 | Term | Meaning |
 |---|---|
 | **repo** | git repository, identified by normalised URL + commit |
-| **pkg** | package in a repo, declared in `bojo.pkg.toml` |
-| **cmd** | pkg with `kind = "cmd"`, produces a binary |
-| **route** | import path a pkg provides |
-| **cache** | **project-local** working tree under `.bojo/cache/` (D32) |
-| **artifact** | `.mojoc` for (repo, commit, pkg, toolchain, dep closure) |
-| **hook** | external process a pkg wants to run during a build |
-| **allow** | an explicit approval of a hook, one line in `bojo.allow` |
+| **pkg** | library in a repo, declared as `[pkg]` in `bojo.pkg.toml`; its name is derived from the repository name (D83) |
+| **cmd** | optional binary entry `[cmd]` in `bojo.pkg.toml` (default `cmd/main.mojo`), run via `run`/`install`, never imported (D83) |
+| **route** | import path (module path) a pkg provides: `<host>.<owner>.<repo>` for `v0`/`v1`, `v<N>.<host>.<owner>.<repo>` for `v2+` (D82, D83, D88) |
+| **cache** | **project-local** store, module root, and compiler cache under `.bojo/cache/` (D32, D55, D87) |
+| **module root** | materialised source tree in `.bojo/cache/mojo/modules/` passed via `-I` (D87); there are no `.mojoc` precompile artifacts (D64) |
+| **hook** | external process declared by a project (`vendor`, `pre-build`, `post-build`) or a dependency (`vendor` only, D84) |
+| **allow** | an explicit approval of a dependency hook, one JSONL line in `bojo.allow` |
 
 ## 5. Files
+
+| File / Directory | Role | Committed |
+|---|---|---|
+| `bojo.toml` | project manifest (`schema = 1`): entry, toolchains, deps, aliases, root overrides/replacements, linker, own hooks | yes |
+| `bojo.pkg.toml` | repository root manifest (`schema = 1`): `[repo]`, at most one `[pkg]` and one `[cmd]`, deps, `ffi`, `runtime`, `exclude` (D83) | yes |
+| `bojo.lock` | exact resolved dependencies by module path (repo, tag, full 40-char commit, tree OID) and Python wheel hashes | yes |
+| `bojo.allow` | append-only trust log for approved dependency hooks (JSONL) | yes |
+| `API.md` | deterministically generated public API contract from `mojo doc` JSON for library repositories (D91) | yes (libraries) |
+| `.vendor/.vendor.json` | vendored metadata (module path, tag, commit, tree) checked by `bojo vendor --check` (D87) | no |
+| `.bojo/` | project-local store (`cache/mojo/src/`), module root (`cache/mojo/modules/`), compiler cache, Python env (D32, D55, D87) | no |
+| `.out/` | build output (binary, `lib/`, `data/`, optional `python/`) | no |
 
 ### 5.1 `bojo.toml` — what the project needs
 
 ```toml
+schema = 1
+
 [project]
 name    = "example"
 version = "0.1.0"
 entry   = "main.mojo"
 
 [version]
-mojo   = "1.2.0"                   # selects the toolchain (D43)
+mojo   = "1.2.0"                   # selects the toolchain (D43, D86)
 python = "3.12"                    # optional; presence enables bundling (D46)
 
 [build]
@@ -89,20 +102,39 @@ strip  = true
 [deps.local_socket]                # a working directory, developed side by side
 path = "../socket"                 # identity comes from its own [repo] url (D85)
 
-[[deps-from]]                      # one table per (repo, version)
-repo  = "https://github.com/LukasLow/example_pkg"
-tag   = "addition/v0.0.1"
-libs  = ["addition"]
-alias = { addition = "sum" }        # only on a name collision
+[deps-from."https://github.com/bojolib/io"]
+version = "v0.1.0"
+
+[deps-from."https://github.com/bojolib/socket"]
+version = "v2.0.0"
+as      = "socket"                 # root-only alias (D68, D81, D88)
+
+[alias]                            # equivalent explicit alias table, keyed by module path (D68)
+"gh.bojolib.tls" = "tls"
+
+[override."gh.bojolib.io"]         # root-only: resolve a diamond conflict to one version/commit (D89)
+version = "v0.1.2"                 # or commit = "9f3a2b..."
+
+[replace."gh.bojolib.socket"]      # root-only: redirect a module path to a fork or local path (D89)
+repo    = "https://github.com/myorg/socket-fork"
+version = "v1.4.2"                 # or path = "../socket"
 
 [deps.python]                      # Python packages, wheels only (D48)
 numpy  = "2.1.0"
 orjson = "*"
 
+[linker]                           # consumer-compiled native libraries (D57)
+libdirs = [".bojo/native"]
+libs    = []
+
 [hooks]                            # own hooks, no allow needed (D12)
 pre-build  = [["templ", "generate"]]
 post-build = []
 ```
+
+Under `[deps-from]`, the shorthand `"https://github.com/bojolib/io" = "v0.1.0"`
+and `"https://github.com/bojolib/socket" = { version = "v2.0.0", as = "socket" }`
+are equivalent TOML forms of the sub-table syntax above (D81, D83).
 
 ### 5.2 `bojo.pkg.toml` — one repository, one package
 
@@ -115,13 +147,14 @@ Repository root:
 schema = 1
 
 [repo]
-url     = "https://github.com/LukasLow/mojo-tls"
+url     = "https://github.com/bojolib/tls"
 license = "Apache-2.0"
 
 [pkg]                              # the library; the name is derived from url
 description = "TLS 1.2 and 1.3 for Mojo"
 readme      = "README.md"
 docs        = "docs"
+exclude     = ["_tests", "docs", "README.md", "API.md"]
 
 [pkg.linker]
 libs    = ["tls"]
@@ -129,7 +162,7 @@ libdirs = [".bojo/native"]
 ffi     = ["tls.c"]
 runtime = []
 
-[pkg.deps-from."https://github.com/nsalerni/mojo-net"]
+[pkg.deps-from."https://github.com/bojolib/socket"]
 version = "v0.2.8"
 ```
 
@@ -142,6 +175,10 @@ entry = "cmd/main.mojo"            # the default
 repository/
   bojo.pkg.toml
   __init__.mojo      required when [pkg] exists; its layout is the author's choice
+  API.md             generated public API contract (bojo lib api, D91)
+  README.md          optional package overview
+  docs/              optional markdown guides
+  _tests/            test files run by `bojo test` and `bojo lib verify`
   cmd/main.mojo      the default [cmd] entry
 ```
 
@@ -157,6 +194,9 @@ Rules:
 - There are no in-repo dependencies, so no cycle, no diamond and no
   "package name declared twice".
 - Versions are repository-wide: one tag `vX.Y.Z` covers library and command.
+- `[alias]`, `[override]`, and `[replace]` are **forbidden** in `bojo.pkg.toml`;
+  only the root consumer's `bojo.toml` may declare them (D68, D89).
+- `[pkg.hooks]` may declare only the `vendor` phase (D84).
 
 
 ### 5.3 `bojo.lock` — the truth (committed)
@@ -166,12 +206,12 @@ version = 1
 mojo    = "1.2.0-2016d0cd"          # fingerprint from `mojo --version`
 
 [[package]]
-name   = "addition"
-url    = "https://github.com/LukasLow/example_pkg"
-tag    = "addition/v0.0.1"
+name   = "gh.bojolib.socket"        # module path (`v2.gh.bojolib.socket` for v2+)
+repo   = "https://github.com/bojolib/socket"
+tag    = "v0.2.8"
 commit = "9f3a2b1c4d5e6f70a1b2c3d4e5f60718293a4b5c"
 tree   = "git-tree:4d1e…"           # git tree OID of the commit
-alias  = "sum"                      # optional
+alias  = "socket"                   # optional
 
 [python]                            # only when the project bundles Python
 version = "3.12"
@@ -189,7 +229,7 @@ different hash, the build fails — that is the supply-chain alarm.
 ### 5.4 `bojo.allow` — trust log (JSONL, committed)
 
 ```jsonl
-{"repo":"https://github.com/LukasLow/example_pkg","commit":"9f3a2b1c4d5e6f70a1b2c3d4e5f60718293a4b5c","pkg":"web_templ","hook":"pre-build","command":["templ","generate"],"binary":"/usr/local/bin/templ"}
+{"repo":"https://github.com/bojolib/tls","commit":"9f3a2b1c4d5e6f70a1b2c3d4e5f60718293a4b5c","pkg":"tls","hook":"vendor","command":["cc","-shared","-fPIC","-O2","-o",".bojo/native/libtls.so","tls.c"],"binary":"/usr/bin/cc"}
 ```
 
 Append-only, written only by `bojo allow`. One entry per line.
@@ -200,6 +240,7 @@ Append-only, written only by `bojo allow`. One entry per line.
 |---|---|
 | Tag format | `v<major>.<minor>.<patch>[-<pre>]` |
 | Scope | the whole repository: one version for library and command (D83) |
+| Major `v2+` | flat repo (`main` tracks latest major, optional `v1` branch); import path gets leading `v<N>.` prefix (D88) |
 | Truth | the **commit**; the tag is a label |
 | `@latest` | highest semver |
 | `@<hash>` | 7–40 hex, must resolve **unambiguously**, otherwise error |
@@ -208,8 +249,8 @@ Append-only, written only by `bojo allow`. One entry per line.
 ## 7. Repository identity and URLs
 
 ```
-https://github.com/LukasLow/example_pkg#addition@v0.1.0
-└───────────── repo ──────────────┘└─ pkg ─┘└ version ┘
+https://github.com/bojolib/socket@v0.1.0
+└───────────── repo ────────────┘└ ver ┘
 ```
 
 Normalisation, in this order (D14a):
@@ -222,9 +263,14 @@ Normalisation, in this order (D14a):
 5. Lowercase scheme and host; **path stays case-sensitive**; IPv6 in `[…]`.
 6. Remove default ports.
 
-`urlhash12 = hex(sha256(normalised))[:12]`.
+The import path (module path) is derived from the normalised URL and major
+version (D82, D83, D88):
 
-The import path starts with a short host segment (D82). The table is closed:
+- `v0.x` and `v1.x` (or untagged commits): `<host>.<owner>.<repo>` (e.g. `gh.bojolib.socket`).
+- `v2.0.0+`: `v<N>.<host>.<owner>.<repo>` (e.g. `v2.gh.bojolib.socket`).
+- The repository name is converted to a Mojo identifier (`mojo-tls` → `mojo_tls`).
+
+The host segment comes from a closed table (D82):
 
 | Host | Segment |
 |---|---|
@@ -236,88 +282,96 @@ The import path starts with a short host segment (D82). The table is closed:
 
 An unknown host keeps its literal name. No abbreviation is invented for it,
 because a later mapping could collide with a host that already used that name.
+Leading `v<N>.` sits outside this host table, so major-version prefixes can
+never collide with a host alias, owner, repository, or submodule name (D88).
 
-Without `#`: the whole repo, pkg name = repo name, otherwise a recursive scan
-(depth ≤ 4). Fallback, not the main path (D4).
-
-## 8. Cache — project-local (D32)
+## 8. Cache — project-local (D32, D55, D63, D64, D70, D87)
 
 ```
 project/
   .bojo/
     cache/
-      src/<urlhash12>/<commit12>/            working copy, writable
-          meta.json                          {url, tag, commit, tree, fetched}
-          …repo content (hooks may write here)…
-      obj/<urlhash12>/<commit12>/<pkgslug>/<toolchain>/<deps12>/<route>.mojoc
-    modules/<route> -> cache/src/<…>/<module root>
-    mojo-cache/                              MODULAR_CACHE_DIR
-    state.json                               resolved objects, fingerprints
+      mojo/
+        src/<host>/<owner>/<repo>@<commit8>/  working checkout, writable (D33, D63, D70)
+        modules/                              materialised module root (-I) (D87)
+          gh/bojolib/io/__init__.mojo
+          v2/gh/bojolib/socket/__init__.mojo
+          socket/__init__.mojo                root alias shim (D68)
+        compiler/                             MODULAR_CACHE_DIR (D15)
+      python/<version>/<key>/                 interpreter + site-packages (D55)
+    lock                                      project build lock
+  .vendor/
+    .vendor.json                              vendored metadata for `vendor --check` (D87)
   .out/                                       result of `bojo build`
 ```
 
 - **Integrity is checked while fetching**, not forever: clone the pinned commit,
-  compare the tree OID with `bojo.lock`. Afterwards the tree is intentionally
-  writable — hooks and builds write there (D33).
-- `<toolchain>` = fingerprint from `mojo --version` (`1.2.0-2016d0cd`), not the
-  display name (D35).
-- `<deps12>` = 12 hex over the **canonically sorted** list of
-  `<urlhash12>@<commit12>` of the transitive dependencies (D23).
-- `<pkgslug>` = pkg name lowercased, `[a-z0-9-]`; a collision is a conflict.
-- `<route>` is the import name **and the file name of the `.mojoc`** — per
-  `mojo precompile`, the file name determines the import name. An alias
-  therefore produces a second artifact of the same source (D8/D37).
-
-`.bojo/` is gitignored. `bojo clean` removes it.
+  compare the tree OID with `bojo.lock`. Afterwards the store checkout is
+  writable — `vendor` hooks run there and write build outputs into `.bojo/` (D33, D84).
+- **No `.mojoc` precompile cache** (D64): Mojo compiles directly from the
+  materialised source tree in `.bojo/cache/mojo/modules/`.
+- Path elements use the **8-hex short commit** (`<repo>@<commit8>`) while
+  `bojo.lock` records the **full 40-character commit** (D70).
+- `<toolchain>` identity is the fingerprint from `mojo --version`
+  (`1.2.0-2016d0cd`), not the display name (D35).
+- `.bojo/`, `.vendor/`, and `.out/` are gitignored. `bojo clean` removes `.bojo/`;
+  `bojo clean --all` also removes `.out/` and `.vendor/`.
 
 Cost of this model, accepted on purpose (D32): every dependency exists once per
-project, not once per machine; no shared build cache; `install`/`run` cache
+project, not once per machine; no shared object cache; `install`/`run` cache
 nothing at all (§11a).
 
 ## 9. Resolution
 
 | # | Rule |
 |---|---|
-| R1 | **One route → exactly one pkg.** Checked on the final (post-alias) route name, case-folded, and against project-local top-level directories. |
-| R2 | `alias` only for a pkg with **exactly one** route that starts with the pkg name; the alias replaces the first segment. |
-| R3 | `in-repo` deps inherit the commit of the repo. |
-| R4 | A cycle in the pkg graph is an error with a path. |
-| R5 | Two pkg names colliding inside one repo tree are an error. |
-| R6 | Determinism: conflicts are errors, never overwrites; import order is irrelevant. |
-| R7 | `alias` is allowed; it produces a second `.mojoc` under the route name, because the file name determines the import name (D8/D37). |
+| R1 | **One module path → exactly one pkg.** Checked on the final (post-alias) route name, case-folded, and against project-local top-level directories. |
+| R2 | Module paths are derived from URL + major version: `<host>.<owner>.<repo>` for `v0`/`v1`, `v<N>.<host>.<owner>.<repo>` for `v2+` (D82, D83, D88). Different major versions have distinct paths and coexist cleanly. |
+| R3 | **Strict commit equality by default (D69):** two different commits for the same module path produce an explicit error naming both dependency chains — bojo never upgrades silently (no MVS). |
+| R4 | **Root-only `[override]` and `[replace]` (D89):** the consumer's root `bojo.toml` may pin one version/commit (`[override]`) or redirect a module path to a fork/local path (`[replace]`). Both are forbidden in `bojo.pkg.toml`. |
+| R5 | A cycle in the pkg graph is an error printing the cycle path. |
+| R6 | Determinism: conflicts are errors, never overwrites; declaration order is irrelevant. |
+| R7 | Aliases are root-only in `bojo.toml` (D68): bojo generates `.bojo/cache/mojo/modules/<alias>/__init__.mojo` re-exporting the full module path (D64, D87). |
 
 ## 10. Module root and `-I`
 
 ```
-project/.bojo/modules/
-  sum      ->  cache/src/<hash>/<commit12>/lib/addition
-  web_http ->  cache/src/<hash>/<commit12>/lib/web_http
+project/.bojo/cache/mojo/modules/
+  gh/bojolib/io/__init__.mojo
+  v2/gh/bojolib/socket/__init__.mojo
+  socket/__init__.mojo                  # root alias: `from v2.gh.bojolib.socket import *`
 ```
 
-- One `-I` on `.bojo/modules`, plus the project root for project-local packages
-  (D27).
-- The module root is swapped via a pointer symlink plus rename, or a temp dir plus
-  `rename` where the platform allows an atomic directory exchange (D26a).
-- The consumer's Mojo source stays unchanged: `from sum import add` or
-  `from addition import add`, depending on the alias. No enforced `akku.` prefix
-  (D13/D14).
+- One `-I` on `.bojo/cache/mojo/modules`, plus the project root `.` for
+  project-local packages (D27, D87) and any directories listed in `[build] include`.
+- `.vendor/` keeps only `.vendor.json` (metadata for `bojo vendor --check`),
+  never source files or build outputs (D87).
+- The module root is swapped atomically via temp directory + `rename` / pointer
+  swap (D26, D26a).
+- Consumer Mojo source stays unchanged: libraries write full paths
+  (`from gh.bojolib.io import Reader`, `from v2.gh.bojolib.socket import Socket`);
+  end-user applications may also import root aliases (`from socket import Socket`).
+  No enforced `akku.` prefix (D13, D14, D68).
 
 ## 11. Build pipeline
 
 | # | Step | Failure |
 |---|---|---|
 | 1 | Load and validate `bojo.toml` | exit 1 |
-| 2 | Resolve; fetch missing repos into `.bojo/cache/mojo/src`, verify the tree OID | exit 4 |
-| 3 | `--locked`: compare lock against resolution | exit 5 |
-| 4 | Take the project lock; swap `.bojo/modules` | exit 1 |
-| 5 | Check hooks (§12). Missing approval → **abort, execute nothing** | exit 2 |
-| 6 | Run pre-build hooks (topological, `cwd` = package dir, may write) | exit 2/3 |
-| 7 | Precompile into `cache/obj` — **not** for pkgs with a `pre-build` hook (D40) | exit 3 |
-| 8 | Collect linker flags from every pkg (`[linker]`) | — |
-| 9 | `mojo build <entry> -I .bojo/modules -I . <flags>` with the toolchain from `[version] mojo` (D43/D47) | exit 3 |
-| 10 | Post-build: `strip`, closure into `.out/lib`, relative RPATH at link time, re-sign on macOS | exit 3 |
+| 2 | Resolve graph (applying root `[override]`/`[replace]`); fetch missing repos into `.bojo/cache/mojo/src`, verify tree OID, run static pull check (D90) | exit 1/4 |
+| 3 | `--locked`: compare `bojo.lock` against resolution | exit 5 |
+| 4 | Resolve `[version] mojo` toolchain (auto-installing if missing, D86) | exit 1/4 |
+| 5 | Check dependency `vendor` hooks (§12). Missing approval → **abort, execute nothing** | exit 2 |
+| 6 | Take the project lock; materialise `.bojo/cache/mojo/modules` (filtering `[pkg] exclude`, D73) and write `.vendor/.vendor.json` (D87) | exit 1 |
+| 7 | Run project own `pre-build` hooks (`cwd` = project root, printed on every build, D12) | exit 3 |
+| 8 | Collect linker flags from every pkg (`[pkg.linker]`) and project (`[linker]`) | — |
+| 9 | `mojo build <entry> -I .bojo/cache/mojo/modules -I . <flags>` with the selected toolchain (D43, D47, D64, D87) | exit 3 |
+| 10 | Post-build: `strip`, runtime closure into `.out/lib`, relative RPATH at link time, copy `runtime` data to `.out/data/<pkg>/`, bundle Python if `[version] python` is set, re-sign on macOS, run own `post-build` hooks | exit 3 |
 
-`MODULAR_CACHE_DIR` = `.bojo/mojo-cache` (D15). Step 10 per platform:
+Dependency `vendor` hooks run once when sources are materialised (`bojo vendor`,
+`bojo update`, `bojo get`, `bojo run`/`install`), never during `bojo build` (D84).
+
+`MODULAR_CACHE_DIR` = `.bojo/cache/mojo/compiler` (D15, D55). Step 10 per platform:
 
 | | Linux | macOS |
 |---|---|---|
@@ -332,13 +386,14 @@ Both build **outside** the project cache, in a temporary directory
 
 ```
 tmp/bojo-<rand>/
-  src/<commit12>/      clone at the pinned commit
-  obj/                 precompile
-  .out/<cmd>            binary
+  .bojo/cache/mojo/src/      clone at the pinned commit
+  .bojo/cache/mojo/modules/  materialised module root
+  .out/<cmd>                 binary
 ```
 
-Flow: resolve → clone (verify tree) → hook gate → build → for `install` copy the
-binary to `~/.bojo/bin/<name>`, for `run` execute it → remove the temp directory.
+Flow: resolve → clone (verify tree + static pull check) → hook gate → materialise
+& run approved `vendor` hooks → build `[cmd]` → for `install` copy the binary to
+`~/.bojo/bin/<name>`, for `run` execute it → remove the temp directory.
 
 - No cache, no reuse: every `install`/`run` compiles from scratch (D34a).
 - `$BOJO_BIN` overrides `~/.bojo/bin`.
@@ -350,16 +405,26 @@ binary to `~/.bojo/bin/<name>`, for `run` execute it → remove the temp directo
 
 ### 12.1 Shape
 
+In a dependency's `bojo.pkg.toml` (D83, D84 — `vendor` phase only):
+
 ```toml
-[pkg.web_templ.hooks]
-pre-build  = [["templ", "generate"]]
-post-build = [["cargo", "build", "--release"]]
+[pkg.hooks]
+vendor = [["cc", "-shared", "-fPIC", "-O2", "-o", ".bojo/native/libtls.so", "tls.c"]]
 ```
 
-- Array of argv arrays. No shell, no file (D16a). `cwd` = package directory,
-  `BOJO_*` set, exit ≠ 0 aborts.
-- Hooks **may** write into the package directory — that is intended (D33). The
-  integrity guarantee applies at fetch time, not to the working tree.
+In a project's `bojo.toml` (all three phases permitted, no approval required, D12):
+
+```toml
+[hooks]
+vendor     = []
+pre-build  = [["templ", "generate"]]
+post-build = []
+```
+
+- Array of argv arrays. No shell, no script file (D16a). `BOJO_*` env vars set;
+  exit ≠ 0 aborts.
+- Dependency hooks run in the **store checkout** (`.bojo/cache/mojo/src/…`),
+  may write build artifacts into `.bojo/`, and never write into `.vendor/` (D33, D84, D87).
 
 ### 12.2 Approval
 
@@ -367,13 +432,13 @@ No built-in trust (D16). `cargo`, `cmake`, `meson`, `make` are treated exactly
 like any other command.
 
 ```
-blocked: pkg 'web_templ' wants to run a hook before build
-  repo     https://github.com/LukasLow/example_pkg
+blocked: pkg 'tls' wants to run a hook during vendor
+  repo     https://github.com/bojolib/tls
   commit   9f3a2b1c4d5e
-  pkg      web_templ
-  hook     pre-build
-  command  templ generate
-  binary   /usr/local/bin/templ
+  pkg      tls
+  hook     vendor
+  command  cc -shared -fPIC -O2 -o .bojo/native/libtls.so tls.c
+  binary   /usr/bin/cc
 
 Not run. Inspect the repo and the command above, then approve with:
 
@@ -386,11 +451,11 @@ Blocked by 1 hook. Nothing was executed.
 - `bojo allow --json '{…}'` for agents; `bojo allow --list` shows approvals and
   marks stale ones.
 - **No `-y`, no "allow all", no Enter-to-confirm.**
-- A line is only valid if (repo, commit) is in the current lock (D28).
+- A line is only valid if `(repo, commit)` is in the current lock (D28).
 - Own hooks (`[hooks]` in the project's own `bojo.toml`) need no approval but are
   printed on every build (D12).
-- Path deps have no commit: directory hash, recomputed on every build; symlink
-  targets are hashed, not followed (D17).
+- Local path dependencies (`[deps.<label>] path = "…"`) are unpinned and **may
+  not declare hooks** (D85).
 
 ### 12.3 Residual risks
 
@@ -412,16 +477,16 @@ source is materialised — `bojo vendor`, `bojo update`, `bojo get` and
 | Property | Value |
 |---|---|
 | Working directory | the **store checkout** (`.bojo/cache/mojo/src/…`), never `.vendor` |
-| Output | belongs in `.bojo/` (e.g. `.bojo/native/`), not in the vendored source |
+| Output | belongs in `.bojo/` (e.g. `.bojo/native/`), not in `.vendor/` |
 | Approval | the same gate as before: unapproved → **exit 2, nothing runs** |
 | Log | `bojo.allow` is committed, so CI runs the same hooks without a prompt |
 
 Consequences:
 
-- `.vendor` stays pure source, so a committed or cached `.vendor` cannot carry a
-  macOS `.dylib` into a Linux CI run.
-- A build is pure: no compiler runs on it, and `bojo build` is reproducible from
-  the lock plus `.bojo/`.
+- `.vendor/` stays metadata-only (`.vendor.json`, D87), so nothing committed or
+  cached there can carry a macOS `.dylib` into a Linux CI run.
+- A build is pure: no dependency compiler hook runs on `bojo build`, and the
+  build is reproducible from the lock plus `.bojo/`.
 - `.bojo/` is not committed, so CI starts with an empty cache and builds in its
   own platform. There is no "it thinks it already has something".
 
@@ -433,27 +498,36 @@ A project's own hooks (`[hooks]` in `bojo.toml`) keep all phases `vendor`,
 | Command | Purpose |
 |---|---|
 | `bojo init` / `bojo new` | create a project |
+| `bojo get <url>@<ver> [--as <name>]` | add a library dependency, run static pull check (D83, D90) |
+| `bojo remove <url>` | remove a repository dependency |
+| `bojo update` | resolve graph, write `bojo.lock`, run approved `vendor` hooks |
 | `bojo deps list` | show Mojo/Python versions, repositories and Python packages (D50) |
 | `bojo deps add <url>@<ver> [--as <name>]` | add a repository dependency (D83) |
 | `bojo deps add-python <name>[@<ver>]` | add a Python package to `[deps.python]` |
-| `bojo deps check` | newer versions and CVEs (POST-V0.1, P21) |
-| `bojo remove <url>` / `bojo update [url]` | remove / re-resolve |
+| `bojo vendor [--check]` | materialise `.bojo/cache/mojo/modules`, write `.vendor/.vendor.json`, run `vendor` hooks (`--check` verifies only, D84, D87) |
+| `bojo validate` | check manifests, graph, and `.vendor/.vendor.json` agree |
 | `bojo build [--locked]` | build into `.out/` |
-| `bojo run <url>@<ver>` | ephemeral build and run the repository's `[cmd]` (§11a) |
-| `bojo install <url>#<pkg>@<ver>` | ephemeral build, binary to `~/.bojo/bin` (§11a) |
-| `bojo test` / `bojo fmt` / `bojo doc` | delegate to the driver |
-| `bojo tree` / `bojo why <pkg>` | graph / provenance |
-| `bojo verify` | check the lock against a fresh checkout (never the working tree) |
+| `bojo run <url>@<ver>` | ephemeral build and run the repository's `[cmd]` (§11a, D83) |
+| `bojo install <url>@<ver>` | ephemeral build, binary to `~/.bojo/bin` (§11a, D83) |
+| `bojo test` | run every `_tests/*.mojo`, exit 3 on failure |
+| `bojo fmt [paths…]` | delegate to `mojo format` |
+| `bojo docs <module-path> [path]` | render `API.md`, `docs/index.md`, or a file inside `docs/` (D76, D91) |
+| `bojo tree` / `bojo why <module-path>` | dependency graph / provenance |
+| `bojo verify` | check `bojo.lock` against a fresh checkout (never the working tree, D36) |
+| `bojo lib verify [--check-outdated] [--strict-semver] [--json]` | run the 5-check library verification gate locally or in CI (D90) |
+| `bojo lib api [--check] [--output API.md]` | generate or verify deterministic `API.md` from `mojo doc` JSON (D91) |
+| `bojo lib pages [--output <dir>]` | generate a zero-CDN static HTML docs site from `mojo doc`, `README.md`, and `docs/` (D92) |
 | `bojo doctor` | mojo version + fingerprint, C compiler, triple, PATH, `~/.bojo/bin` |
-| `bojo toolchain mojo install <ver>` | install a Mojo toolchain into `~/.bojo/mojo/<ver>` (D43) |
-| `bojo toolchain mojo list` | list installed Mojo toolchains |
-| `bojo toolchain python install <ver>` | install a relocatable CPython into `~/.bojo/python/<ver>` (D44) |
-| `bojo toolchain python list` | list installed Python runtimes |
+| `bojo toolchain [mojo\|python] list` | list installed Mojo / Python toolchains (D49) |
+| `bojo toolchain install <mojo\|python> <ver>` | install a Mojo or Python toolchain into `~/.bojo/` (D43, D44, D49) |
 | `bojo toolchain remove <mojo\|python> <ver>` | delete an installed toolchain |
-| `bojo cache list` / `bojo cache clear` | show / clear the project cache |
-| `bojo allow <id>\|--json\|--list` | approve / show hooks |
+| `bojo repo-index <url>[@ref] [--follow]` | read manifests over raw HTTP, emit JSONL (D78) |
+| `bojo search <term> [--index <file>] [--json]` | search a repo index |
+| `bojo cache list` / `bojo cache clear` | show / clear `.bojo/cache/` |
+| `bojo allow <id>\|--json\|--list` | approve / list hooks |
 | `bojo clean [--all]` | remove `.bojo/` (`--all`: also `.out/` and `.vendor/`) |
-| `bojo skill [<runtime>]` | print the agent skill as markdown (§19) |
+| `bojo skill [<runtime>]` | print the agent skill as markdown (§19, D41) |
+| `bojo version` | print the bojo version |
 
 Exit codes:
 
@@ -462,9 +536,9 @@ Exit codes:
 | 0 | success |
 | 1 | usage or configuration error |
 | 2 | blocked by a missing hook approval — nothing was executed |
-| 3 | build or link failure |
+| 3 | build, link, test, or library verification failure |
 | 4 | network, clone or checkout failure |
-| 5 | lock conflict (`--locked`) |
+| 5 | lock or vendor conflict (`--locked`, `vendor --check`) |
 
 ## 14. Output modes and platforms
 
@@ -588,6 +662,11 @@ Exit codes:
 | **D87** | the extracted module root lives in `.bojo/cache/mojo/modules/` and `-I` points there; `.vendor/` keeps only `.vendor.json`, which records path, tag, commit and tree for `vendor --check` | keep the module root inside `.vendor/` | a build must never read from a directory that also receives build output: a vendor tree that a hook can write into is how one platform's artefact reaches another, and `.bojo/` is the one place that is regenerated and never committed |
 | **D86** | a toolchain pinned in `[version]` (`mojo`, `python`) but not installed is fetched automatically on first use, after printing exactly what it installs; the explicit `bojo toolchain install` remains | fail with a "not installed" error and a hint | the version lives in `bojo.toml`, so a fresh checkout or a CI runner needs no second command; an implicit fetch that announces itself is cheaper than a failed build, and `.bojo/` stays the only place it lands |
 | **D85** | a local dependency is a directory (`[deps.<label>] path = "…"`); its import path comes from its own `[repo] url`, it is never pinned in `bojo.lock`, and it may not declare hooks | a synthetic `local.<name>` path, or pinning a directory hash | the identity must survive the move to a published repository: a library developed locally and later pushed keeps its import path, and an unpinned tree has nothing to approve a hook against |
+| **D88** | flat Git repositories (`main` tracks the latest major version, optional `v1` branch for `v1.x` maintenance tags; never `v1/`/`v2/` subdirectories) combined with collision-free major-prefixed import paths: `gh.<owner>.<repo>` for `v0.x`/`v1.x`, and `v<N>.gh.<owner>.<repo>` for `v2.0.0+` | Go-style `v2/` subdirectories inside the repo, separate `-v2` repos, or trailing `.v2` module suffixes (`gh.<owner>.<repo>.v2`) | flat repos keep Git history and layout simple without duplicating directories or forcing repo renames; a trailing `.v2` collides with real submodules named `v2`, whereas a leading `v<N>.` sits outside the closed host-alias table (D82) and lets `v1` and `v2` coexist physically in `.bojo/cache/mojo/modules/` without colliding with any owner, repo, or submodule |
+| **D89** | root-only `[override]` and `[replace]` tables in `bojo.toml` layered on top of D69's strict default: `[override."<module-path>"]` pins one version/commit to resolve a diamond conflict; `[replace."<module-path>"]` redirects a module path to a fork URL or local path; both are forbidden in `bojo.pkg.toml` | Minimal Version Selection (MVS) / silent highest-version-wins upgrades, or allowing libraries to override transitive dependencies | preserves D69's guarantee that bojo never silently upgrades code, while giving the root application an explicit, auditable, lock-tracked escape hatch for diamond conflicts, urgent patches, and local fork testing without letting libraries hijack downstream graphs |
+| **D90** | `bojo lib verify` provides a 5-check library verification gate (1. manifest & import purity; 2. isolated non-excluded consumer build probe + `_tests/*.mojo`; 3. outdated dependency check; 4. `API.md` freshness + semver breaking-change diff; 5. Mojo toolchain compatibility); `bojo get` and `bojo vendor` run only a fast **static-only** pull check (manifest validity, import purity, package structure — zero foreign code execution) | auto-running library tests or build probes on `bojo get`/`vendor`, or relying on ad-hoc per-repo CI scripts | pulling a dependency must never execute foreign code (D16, D84); separating a fast static pull guard from an explicit, standardised `bojo lib verify` gate lets library authors and template CI enforce strict release quality without compromising consumer safety |
+| **D91** | code-first public API contract extracted from Mojo source and docstrings via `mojo doc` JSON, deterministically rendered into a committed `API.md` (`bojo lib api`), with structural breaking-change diffing against the previous release tag | manually declaring exported APIs in `bojo.pkg.toml`, or hand-written API docs only | manual manifests drift from source code; extracting from `mojo doc` keeps source + docstrings as the single source of truth, makes `API.md` diffable in PRs and readable by humans and agents, and enables automated semver breaking-change detection |
+| **D92** | `bojo lib pages` generates a unified, self-contained, zero-CDN static HTML documentation site per library repository from `mojo doc` JSON, `README.md`, and `docs/`, ready for GitHub Pages (`https://<org>.github.io/<repo>/`) | external JS/Python doc generators (MkDocs, Docusaurus, Sphinx) or loading fonts/scripts/styles from third-party CDNs | zero external build tools keeps template CI fast and identical across every library repo, guarantees consistent navigation/search/install snippets, and zero-CDN static HTML works offline without third-party breakage or tracking |
 
 ## 21. Runtime requirements (verified)
 
@@ -769,85 +848,178 @@ bojo skill > .agents/skills/bojo/SKILL.md
 - It states the limits explicitly (no static ELF, no embedded runtime, no
   automatic hooks) and the exit-code semantics, because agents act on them.
 
-## 22. Store, vendor and manifests
+## 22. Store, module root, versioning, and library tooling
 
-Settled in D61–D69.
+Settled in D61–D92.
 
 ### 22.1 Import paths
 
 ```
-gh.LukasLow.mojo_tls
+gh.bojolib.tls          # v0.x and v1.x
+v2.gh.bojolib.socket    # v2.0.0+ (D88)
 ```
 
-Built from the repository URL alone: the repository name is the package name,
-as a Mojo identifier (D83). Where the author keeps its modules below
-`__init__.mojo` does not appear in the path.
+Built from the repository URL and major version alone: the repository name is
+the package name as a Mojo identifier (`mojo-tls` → `mojo_tls`, D83). Where the
+author keeps internal modules below `__init__.mojo` does not appear in the path.
 
-Mojo splits on dots, so on disk the host becomes one segment (D82):
+Mojo splits on dots, so on disk the module path maps directly into the module
+root `.bojo/cache/mojo/modules/` (D82, D87, D88):
 
 ```
-.vendor/gh/LukasLow/mojo_tls/__init__.mojo
+.bojo/cache/mojo/modules/gh/bojolib/tls/__init__.mojo
+.bojo/cache/mojo/modules/v2/gh/bojolib/socket/__init__.mojo
 ```
 
-Inside a library the import is always written in full. Only the end user may
-shorten it, and only in `bojo.toml` — keyed by module path, so two repositories
-with the same name stay distinguishable:
+Inside a library the import is always written in full. Only the root consumer
+may shorten it, and only in `bojo.toml` — keyed by module path, so two
+repositories (or two major versions of the same repository) stay distinguishable
+(D68):
 
 ```toml
 [alias]
-"gh.nsalerni.mojo_tls" = "tls"
+"gh.bojolib.tls" = "tls"
+"v2.gh.bojolib.socket" = "socket"
 ```
 
-bojo then generates `.vendor/tls/__init__.mojo` with `from …mojo_tls import *`.
+bojo generates `.bojo/cache/mojo/modules/tls/__init__.mojo` with
+`from gh.bojolib.tls import *` and
+`.bojo/cache/mojo/modules/socket/__init__.mojo` with
+`from v2.gh.bojolib.socket import *` (D68, D87).
 
-### 22.2 Store and vendor
+### 22.2 Store, module root, and `.vendor/.vendor.json`
 
-The store keeps complete repositories, read-only, one checkout per commit:
+The store keeps complete repositories, one checkout per commit (writable for
+approved `vendor` hooks, D33, D63, D70, D84):
 
 ```
-.bojo/cache/mojo/src/github.com/LukasLow/bojo_demo_pkg@6a3efcc2/
+.bojo/cache/mojo/src/github.com/bojolib/socket@6a3efcc2/
 ```
 
-The vendor tree is flat and holds exactly one directory per module path:
+The extracted module root is flat under `.bojo/cache/mojo/modules/` and holds
+exactly one directory per module path, with `[pkg] exclude` already filtered out
+(D73, D87):
+
+```
+.bojo/cache/mojo/modules/
+    gh/bojolib/io/
+    gh/bojolib/tls/
+    gh/bojolib/socket/                <- v1.x
+    v2/gh/bojolib/socket/             <- v2.x, side by side (D88)
+    socket/__init__.mojo              <- optional root alias (D68)
+```
+
+`.vendor/` holds **only** `.vendor.json` (recording module path, repo, tag,
+commit, tree, and `required_by` for `bojo vendor --check`), never source trees
+or build artifacts (D87):
 
 ```
 .vendor/
-    .vendor.json          route -> repo, tag, commit, required_by
-    .vendor.lock          copy of bojo.lock at vendoring time
-    gh/LukasLow/mojo_tls/
-    gh/nsalerni/mojo_net/
-    gh/Anna/mojosocket/               <- and
-    gh/Markus/mojosocket/             <- both, side by side
+    .vendor.json
 ```
 
-One module root: `mojo build … -I .vendor`.
+One module root: `mojo build … -I .bojo/cache/mojo/modules -I .`.
 
-Because the path is the identity, two providers of the same short name never
-meet, and a package used by several dependents is compiled once.
+Because the module path is the identity, two providers of the same short name
+never collide, `v1` and `v2` coexist physically, and a package used by several
+dependents is compiled once.
 
-### 22.3 Versions
+### 22.3 Versions and `v2+` branching (D83, D88)
 
-One version per repository, and the repository is the package (D83). One tag
-covers the library and the command:
+- **Flat Git repository:** never create `v1/` or `v2/` subdirectories inside a
+  repository.
+- **Git branching:** `main` always tracks the latest major version. When a
+  library moves to `v2.0.0`, maintenance releases for `v1.x` (e.g. `v1.12.4`) are
+  tagged from an optional `v1` branch.
+- **Repository-wide tags:** one tag `vX.Y.Z` covers both `[pkg]` and `[cmd]`.
+  Prefixed tags (`<pkg>/vX.Y.Z`, `<pkg>@vX.Y.Z`) are ignored.
+- **Major-prefixed import paths:** `v0.x` and `v1.x` use `<host>.<owner>.<repo>`;
+  `v2.0.0+` use `v<N>.<host>.<owner>.<repo>`.
 
+### 22.4 Root overrides and replacements (D89)
+
+D69 remains the strict default: if two dependencies resolve to different commits
+for the same module path, resolution fails with an error naming both chains.
+
+To resolve a diamond conflict, apply an urgent patch, or develop against a fork
+or local checkout, the root consumer's `bojo.toml` (never a library's
+`bojo.pkg.toml`) may declare:
+
+```toml
+[override."gh.bojolib.io"]
+version = "v0.2.1"                 # or commit = "9f3a2b..."
+
+[replace."gh.bojolib.socket"]
+repo    = "https://github.com/myorg/socket-fork"
+version = "v1.4.2"                 # or commit = "...", or path = "../socket"
 ```
-v0.0.2
-```
 
-A breaking change gets a new path segment by convention (`mojo_tls.v2` or a
-separate repository `mojo-tls-v2`); bojo does not enforce a scheme.
+- `[override]` keeps the original repository URL and pins the resolved version
+  or commit for that module path across the entire dependency graph.
+- `[replace]` redirects that module path to another repository URL (at a
+  version/commit) or to a local directory (`path`).
+- Overrides and replacements are reflected in `bojo.lock` (except local `path`
+  replacements, consistent with D85) and reported by `bojo tree` / `bojo why`.
+- Declaring `[override]` or `[replace]` in `bojo.pkg.toml` is a validation error.
 
-### 22.4 Manifests
+### 22.5 Library verification (`bojo lib verify`) and static pull checks (D90)
+
+`bojo lib verify` runs a standardised 5-check verification gate for library
+repositories, locally and in CI (on push, PR, and weekly schedule):
+
+1. **Manifest & import purity:** Validate `bojo.pkg.toml` (`schema = 1`,
+   `[repo] url`, no forbidden root-only tables), forbid bare/short/alias or
+   Pixi-only imports inside library code, and verify every external `bojo`
+   import is declared in `[pkg.deps-from]`.
+2. **Isolated consumer build probe + tests:** Materialise only the non-excluded
+   files (`[pkg] exclude`, like `cargo package --dry-run`), verify a minimal
+   external consumer compiles against the materialised package, and run every
+   `_tests/*.mojo`.
+3. **Outdated dependency check:** Inspect declared dependencies for newer
+   upstream semver tags (advisory by default; fail-able via `--check-outdated`
+   in scheduled weekly CI).
+4. **API & semver contract check:** Verify committed `API.md` matches the fresh
+   `mojo doc` JSON output and diff the public API against the previous release
+   tag to detect breaking changes without a major version bump (D91).
+5. **Mojo toolchain compatibility check:** Verify the library compiles and
+   passes tests against the active/pinned Mojo toolchain (exercised in weekly
+   CI to catch upstream compiler regressions early).
+
+**Automatic pull checks (`bojo get` / `bojo vendor`):**
+
+- When pulling or vendoring a dependency, bojo runs fast, **static-only** checks:
+  manifest validity, import purity, and package directory structure.
+- **Zero foreign code execution:** tests, build probes, and unapproved hooks
+  never auto-run on pull (consistent with D16, D84).
+
+### 22.6 Code-first API contract (`API.md`) and static docs (`bojo lib pages`) (D91, D92)
+
+- **Single source of truth (D91):** Public symbols, signatures, and docstrings
+  are extracted directly from Mojo source via `mojo doc` (JSON). There is no
+  manual API listing in `bojo.pkg.toml`.
+- **`API.md` (`bojo lib api`):** Deterministically rendered from `mojo doc` JSON
+  and committed to the library repository. It gives humans and agents an exact,
+  scannable API summary, produces clean PR diffs, powers `bojo docs`, and is
+  checked for freshness (`bojo lib api --check` / `bojo lib verify`). Comparing
+  the extracted JSON against the previous release tag powers automated
+  breaking-change detection.
+- **Static documentation site (`bojo lib pages`, D92):** Generates a unified,
+  self-contained, **zero-CDN** static HTML site from `mojo doc` JSON,
+  `README.md`, and `docs/` (sidebar navigation, client-side search, signatures,
+  `bojo get` snippet, guides), ready for GitHub Pages at
+  `https://<org>.github.io/<repo>/`.
+
+### 22.7 Manifests and shipping
 
 | File | Where | Mandatory | Contains |
 |---|---|---|---|
-| `bojo.toml` | project | yes | project, entry, versions, hooks, linker, include, aliases |
-| `bojo.pkg.toml` | repository root | yes | `[repo]`, at most one `[pkg]` and one `[cmd]`, `ffi`, `runtime`, `exclude`, deps |
+| `bojo.toml` | project | yes | project, entry, versions, deps, aliases, overrides/replacements, hooks, linker, include |
+| `bojo.pkg.toml` | repository root | yes | `[repo]`, at most one `[pkg]` and one `[cmd]`, `ffi`, `runtime`, `exclude`, deps, `vendor` hooks |
+| `API.md` | library root | recommended (verified by `bojo lib verify`) | generated public API contract from `mojo doc` JSON (D91) |
 
-All start with `schema = 1` (D62). Versions are exact (D61).
+All manifests start with `schema = 1` (D62). Versions are exact (D61).
 
-### 22.5 Shipping
-
-A published package carries `bojo.pkg.toml` and `bojo.lock`; the lock records
-repository, tag, full commit and tree for every dependency, so a consumer can
-reproduce the exact tree and `vendor/.vendor.json` stays explainable.
+A published library carries `bojo.pkg.toml`, `bojo.lock` (when it has
+dependencies), `README.md`, `API.md`, `docs/`, and `_tests/`; the lock records
+repository, tag, full commit, and tree OID for every dependency, so consumers
+reproduce the exact tree and `.vendor/.vendor.json` stays explainable.

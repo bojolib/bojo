@@ -14,7 +14,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/LukasLow/bojo/internal/toolchain"
+	"github.com/bojolib/bojo/internal/toolchain"
 )
 
 // Result describes a provisioned environment.

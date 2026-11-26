@@ -5,14 +5,14 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/LukasLow/bojo/internal/build"
-	"github.com/LukasLow/bojo/internal/cache"
-	"github.com/LukasLow/bojo/internal/hooks"
-	"github.com/LukasLow/bojo/internal/manifest"
-	"github.com/LukasLow/bojo/internal/onefile"
-	"github.com/LukasLow/bojo/internal/pyenv"
-	"github.com/LukasLow/bojo/internal/resolve"
-	"github.com/LukasLow/bojo/internal/vendor"
+	"github.com/bojolib/bojo/internal/build"
+	"github.com/bojolib/bojo/internal/cache"
+	"github.com/bojolib/bojo/internal/hooks"
+	"github.com/bojolib/bojo/internal/manifest"
+	"github.com/bojolib/bojo/internal/onefile"
+	"github.com/bojolib/bojo/internal/pyenv"
+	"github.com/bojolib/bojo/internal/resolve"
+	"github.com/bojolib/bojo/internal/vendor"
 )
 
 // buildOnefile builds into a work directory and packs the result into a single

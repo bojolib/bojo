@@ -5,9 +5,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/LukasLow/bojo/internal/manifest"
-	"github.com/LukasLow/bojo/internal/onefile"
-	"github.com/LukasLow/bojo/internal/pyenv"
+	"github.com/bojolib/bojo/internal/manifest"
+	"github.com/bojolib/bojo/internal/onefile"
+	"github.com/bojolib/bojo/internal/pyenv"
 )
 
 // bundlePython provisions the interpreter + wheels and turns the built binary

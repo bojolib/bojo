@@ -1,5 +1,5 @@
-// Package tag implements the `<pkg>/vX.Y.Z` tag grammar and resolution rules
-// (DESIGN §6, D6).
+// Package tag implements repository-wide `vX.Y.Z[-pre]` tag parsing and
+// resolution rules (DESIGN §6, D83).
 package tag
 
 import (
@@ -173,4 +173,35 @@ func Match(ref string, tags []string) (Version, error) {
 		}
 	}
 	return Version{}, fmt.Errorf("no version %s", want)
+}
+
+// MajorOf returns the major version number for a valid semantic version tag
+// (`vX.Y.Z[-pre]`), or 0 otherwise.
+func MajorOf(tagName string) int {
+	v, err := ParseVersion(tagName)
+	if err != nil {
+		return 0
+	}
+	return v.Major
+}
+
+// LatestInMajor returns the highest semantic version tag in the given major
+// version series (e.g. major=2 selects the highest v2.x.y tag).
+func LatestInMajor(tags []string, major int) (string, bool) {
+	var best Version
+	found := false
+	for _, t := range tags {
+		v, ok := versionOf(t)
+		if !ok || v.Major != major {
+			continue
+		}
+		if !found || v.Compare(best) > 0 {
+			best = v
+			found = true
+		}
+	}
+	if !found {
+		return "", false
+	}
+	return best.Raw, true
 }

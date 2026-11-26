@@ -113,7 +113,7 @@ url = "https://github.com/Owner/empty"
 
 func TestRepoURLIsRequired(t *testing.T) {
 	dir := t.TempDir()
-	write(t, dir, "bojo.pkg.toml", "[pkg]\n")
+	write(t, dir, "bojo.pkg.toml", "schema = 1\n[pkg]\n")
 	if _, err := LoadTree(dir); err == nil {
 		t.Fatal("[repo] url is required")
 	}
@@ -160,5 +160,176 @@ readme      = "README.md"
 	}
 	if p.License != "Apache-2.0" || p.Homepage != "https://example.com" || p.Readme != "README.md" {
 		t.Errorf("metadata not parsed: %+v", p)
+	}
+}
+
+func TestSchemaValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		wantErr bool
+	}{
+		{
+			name: "missing schema rejected",
+			content: `[repo]
+url = "https://github.com/bojolib/io"
+[pkg]
+`,
+			wantErr: true,
+		},
+		{
+			name: "schema 2 rejected",
+			content: `schema = 2
+[repo]
+url = "https://github.com/bojolib/io"
+[pkg]
+`,
+			wantErr: true,
+		},
+		{
+			name: "schema 1 accepted",
+			content: `schema = 1
+[repo]
+url = "https://github.com/bojolib/io"
+[pkg]
+`,
+			wantErr: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			write(t, dir, "__init__.mojo", "")
+			write(t, dir, "bojo.pkg.toml", tc.content)
+			_, err := LoadTree(dir)
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected error for %s", tc.name)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error for %s: %v", tc.name, err)
+			}
+		})
+	}
+}
+
+func TestDepsFromMapSyntax(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "__init__.mojo", "")
+	write(t, dir, "bojo.pkg.toml", `schema = 1
+
+[repo]
+url = "https://github.com/bojolib/http"
+
+[pkg]
+description = "HTTP client"
+
+[pkg.deps-from."https://github.com/bojolib/io"]
+version = "v0.1.0"
+
+[pkg.deps-from."https://github.com/bojolib/socket"]
+version = "v1.2.0"
+
+[pkg.deps-from."https://github.com/bojolib/socket@v2"]
+version = "v2.0.0"
+
+[pkg.deps-from."https://github.com/bojolib/bytes"]
+commit = "1111111111111111111111111111111111111111"
+`)
+
+	tree, err := LoadTree(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tree.Pkg.DepsFrom) != 4 {
+		t.Fatalf("deps-from count = %d, want 4", len(tree.Pkg.DepsFrom))
+	}
+	if got := tree.Pkg.DepsFrom["https://github.com/bojolib/io"].Version; got != "v0.1.0" {
+		t.Errorf("io version = %q, want v0.1.0", got)
+	}
+	if got := tree.Pkg.DepsFrom["https://github.com/bojolib/socket@v2"].Version; got != "v2.0.0" {
+		t.Errorf("socket@v2 version = %q, want v2.0.0", got)
+	}
+	if got := tree.Pkg.DepsFrom["https://github.com/bojolib/bytes"].Commit; got != "1111111111111111111111111111111111111111" {
+		t.Errorf("bytes commit = %q", got)
+	}
+}
+
+func TestPkgRejectsRootOnlyTablesAndInvalidDeps(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "override rejected in bojo.pkg.toml",
+			content: `schema = 1
+[repo]
+url = "https://github.com/bojolib/http"
+[pkg]
+[override."gh.bojolib.io"]
+version = "v0.2.0"
+`,
+		},
+		{
+			name: "replace rejected in bojo.pkg.toml",
+			content: `schema = 1
+[repo]
+url = "https://github.com/bojolib/http"
+[pkg]
+[replace."gh.bojolib.io"]
+path = "../io"
+`,
+		},
+		{
+			name: "alias table rejected in bojo.pkg.toml",
+			content: `schema = 1
+[repo]
+url = "https://github.com/bojolib/http"
+[pkg]
+[alias]
+"gh.bojolib.io" = "io"
+`,
+		},
+		{
+			name: "alias inside pkg.deps-from rejected",
+			content: `schema = 1
+[repo]
+url = "https://github.com/bojolib/http"
+[pkg]
+[pkg.deps-from."https://github.com/bojolib/io"]
+version = "v0.1.0"
+as = "io"
+`,
+		},
+		{
+			name: "both version and commit rejected",
+			content: `schema = 1
+[repo]
+url = "https://github.com/bojolib/http"
+[pkg]
+[pkg.deps-from."https://github.com/bojolib/io"]
+version = "v0.1.0"
+commit = "1111111111111111111111111111111111111111"
+`,
+		},
+		{
+			name: "mismatched major suffix rejected",
+			content: `schema = 1
+[repo]
+url = "https://github.com/bojolib/http"
+[pkg]
+[pkg.deps-from."https://github.com/bojolib/socket@v2"]
+version = "v1.0.0"
+`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			write(t, dir, "__init__.mojo", "")
+			write(t, dir, "bojo.pkg.toml", tc.content)
+			if _, err := LoadTree(dir); err == nil {
+				t.Fatalf("%s: expected error, got nil", tc.name)
+			}
+		})
 	}
 }

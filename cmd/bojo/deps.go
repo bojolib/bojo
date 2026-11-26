@@ -6,16 +6,18 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
-	"github.com/LukasLow/bojo/internal/manifest"
-	"github.com/LukasLow/bojo/internal/urlkey"
+	"github.com/bojolib/bojo/internal/manifest"
+	"github.com/bojolib/bojo/internal/tag"
+	"github.com/bojolib/bojo/internal/urlkey"
 )
 
 // cmdDeps is the dependency front end (D50):
 //
 //	bojo deps list
-//	bojo deps add <url>#<pkg>@<ver> [--as <name>]
+//	bojo deps add <url>@<ver> [--as <name>]
 //	bojo deps add-python <name>[@<version>]
 //	bojo deps check            (not implemented yet: newer versions, CVEs)
 func cmdDeps(args []string) int {
@@ -58,24 +60,82 @@ func depsList() int {
 		fmt.Println("no dependencies")
 		return exitOK
 	}
-	for repo, spec := range cfg.DepsFrom {
+	depKeys := make([]string, 0, len(cfg.DepsFrom))
+	for k := range cfg.DepsFrom {
+		depKeys = append(depKeys, k)
+	}
+	sort.Strings(depKeys)
+	for _, rawKey := range depKeys {
+		spec := cfg.DepsFrom[rawKey]
+		repo, majorHint := urlkey.SplitDepKey(rawKey)
 		ver := spec.Version
+		if ver == "" && spec.Commit != "" {
+			ver = shortSHA(spec.Commit)
+		}
 		if ver == "" {
 			ver = "latest"
 		}
+		major := tag.MajorOf(spec.Version)
+		if major == 0 {
+			major = majorHint
+		}
 		name := repo
 		if norm, err := urlkey.Normalize(repo); err == nil {
-			if mp, err := urlkey.ModulePath(norm); err == nil {
+			if mp, err := urlkey.VersionedModulePath(norm, major); err == nil {
 				name = mp
 			}
 		}
 		fmt.Printf("pkg    %s  %s  %s\n", name, repo, ver)
 	}
-	for name, d := range cfg.Deps.Local {
-		fmt.Printf("local  %s  %s\n", name, d.Path)
+	localKeys := make([]string, 0, len(cfg.Deps.Local))
+	for k := range cfg.Deps.Local {
+		localKeys = append(localKeys, k)
 	}
-	for name, ver := range cfg.Deps.Python {
-		fmt.Printf("python %s  %s\n", name, ver)
+	sort.Strings(localKeys)
+	for _, name := range localKeys {
+		fmt.Printf("local  %s  %s\n", name, cfg.Deps.Local[name].Path)
+	}
+	pyKeys := make([]string, 0, len(cfg.Deps.Python))
+	for k := range cfg.Deps.Python {
+		pyKeys = append(pyKeys, k)
+	}
+	sort.Strings(pyKeys)
+	for _, name := range pyKeys {
+		fmt.Printf("python %s  %s\n", name, cfg.Deps.Python[name])
+	}
+	if len(cfg.Override) > 0 {
+		keys := make([]string, 0, len(cfg.Override))
+		for k := range cfg.Override {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			ov := cfg.Override[k]
+			val := ov.Version
+			if val == "" {
+				val = shortSHA(ov.Commit)
+			}
+			fmt.Printf("override %s  %s\n", k, val)
+		}
+	}
+	if len(cfg.Replace) > 0 {
+		keys := make([]string, 0, len(cfg.Replace))
+		for k := range cfg.Replace {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			rep := cfg.Replace[k]
+			if rep.Path != "" {
+				fmt.Printf("replace  %s  path:%s\n", k, rep.Path)
+				continue
+			}
+			val := rep.Version
+			if val == "" {
+				val = shortSHA(rep.Commit)
+			}
+			fmt.Printf("replace  %s  %s@%s\n", k, rep.Repo, val)
+		}
 	}
 	return exitOK
 }

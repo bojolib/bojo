@@ -13,7 +13,8 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
-	"github.com/LukasLow/bojo/internal/urlkey"
+	"github.com/bojolib/bojo/internal/tag"
+	"github.com/bojolib/bojo/internal/urlkey"
 )
 
 // FileName is the only accepted name for a package file (D5).
@@ -46,12 +47,21 @@ type Linker struct {
 	Runtime []string `toml:"runtime"`
 }
 
-// DepFrom is one repository at one version.
-type DepFrom struct {
-	Repo   string            `toml:"repo"`
-	Tag    string            `toml:"tag"`
-	Commit string            `toml:"commit"`
-	Alias  map[string]string `toml:"alias"`
+// DepSpec is one repository dependency declared in bojo.pkg.toml:
+//
+//	[pkg.deps-from."https://github.com/bojolib/io"]
+//	version = "v0.1.0"
+//
+// Or pinned to a commit:
+//
+//	[pkg.deps-from."https://github.com/bojolib/io"]
+//	commit = "9f3a2b1c..."
+//
+// To depend on two major versions of the same repository, suffix the key with
+// "@v<N>" (e.g. "https://github.com/bojolib/socket@v2").
+type DepSpec struct {
+	Version string `toml:"version"`
+	Commit  string `toml:"commit"`
 }
 
 // Pkg is the body of `[pkg]` (a library) or `[cmd]` (a command).
@@ -64,7 +74,7 @@ type Pkg struct {
 	Homepage    string                `toml:"homepage"`
 	Docs        string                `toml:"docs"`
 	Readme      string                `toml:"readme"`
-	DepsFrom    []DepFrom             `toml:"deps-from"`
+	DepsFrom    map[string]DepSpec    `toml:"deps-from"`
 	Linker      Linker                `toml:"linker"`
 	Hooks       map[string][][]string `toml:"hooks"`
 }
@@ -114,6 +124,9 @@ func LoadTree(dir string) (*Tree, error) {
 		if _, err := os.Stat(filepath.Join(dir, "__init__.mojo")); err != nil {
 			return nil, fmt.Errorf("%s: [pkg] needs __init__.mojo at the repository root", path)
 		}
+		if err := validateDeps(path, "pkg", f.Pkg.DepsFrom); err != nil {
+			return nil, err
+		}
 	}
 	if f.Cmd != nil {
 		if f.Cmd.Entry == "" {
@@ -126,8 +139,30 @@ func LoadTree(dir string) (*Tree, error) {
 		if _, err := os.Stat(filepath.Join(dir, entry)); err != nil {
 			return nil, fmt.Errorf("%s: [cmd] entry %q does not exist", path, f.Cmd.Entry)
 		}
+		if err := validateDeps(path, "cmd", f.Cmd.DepsFrom); err != nil {
+			return nil, err
+		}
 	}
 	return t, nil
+}
+
+func validateDeps(path, section string, deps map[string]DepSpec) error {
+	for rawKey, spec := range deps {
+		repoRaw, majorHint := urlkey.SplitDepKey(rawKey)
+		if _, err := urlkey.Normalize(repoRaw); err != nil {
+			return fmt.Errorf("%s: [%s.deps-from.%q]: %w", path, section, rawKey, err)
+		}
+		if spec.Version != "" && spec.Commit != "" {
+			return fmt.Errorf("%s: [%s.deps-from.%q]: set version or commit, not both", path, section, rawKey)
+		}
+		if majorHint > 0 && spec.Version != "" {
+			if v, err := tag.ParseVersion(spec.Version); err == nil && v.Major != majorHint {
+				return fmt.Errorf("%s: [%s.deps-from.%q]: key major v%d disagrees with version %q",
+					path, section, rawKey, majorHint, spec.Version)
+			}
+		}
+	}
+	return nil
 }
 
 func parseFile(path string) (*File, error) {
@@ -145,6 +180,9 @@ func parseFile(path string) (*File, error) {
 	}
 	if u := md.Undecoded(); len(u) > 0 {
 		return nil, fmt.Errorf("%s: unknown keys: %v", path, u)
+	}
+	if f.Schema != 1 {
+		return nil, fmt.Errorf("%s: schema = 1 is required (got %d)", path, f.Schema)
 	}
 	return &f, nil
 }

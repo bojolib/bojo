@@ -15,16 +15,17 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/LukasLow/bojo/internal/build"
-	"github.com/LukasLow/bojo/internal/cache"
-	"github.com/LukasLow/bojo/internal/hooks"
-	"github.com/LukasLow/bojo/internal/lock"
-	"github.com/LukasLow/bojo/internal/manifest"
-	"github.com/LukasLow/bojo/internal/resolve"
-	"github.com/LukasLow/bojo/internal/toolchain"
-	"github.com/LukasLow/bojo/internal/urlkey"
-	"github.com/LukasLow/bojo/internal/vendor"
-	"github.com/LukasLow/bojo/skill"
+	"github.com/bojolib/bojo/internal/build"
+	"github.com/bojolib/bojo/internal/cache"
+	"github.com/bojolib/bojo/internal/hooks"
+	"github.com/bojolib/bojo/internal/lock"
+	"github.com/bojolib/bojo/internal/manifest"
+	"github.com/bojolib/bojo/internal/resolve"
+	"github.com/bojolib/bojo/internal/tag"
+	"github.com/bojolib/bojo/internal/toolchain"
+	"github.com/bojolib/bojo/internal/urlkey"
+	"github.com/bojolib/bojo/internal/vendor"
+	"github.com/bojolib/bojo/skill"
 )
 
 const version = "0.1.0-dev"
@@ -105,6 +106,8 @@ func run(args []string) int {
 		return cmdTest(args[1:])
 	case "vendor":
 		return cmdVendor(args[1:])
+	case "lib":
+		return cmdLib(args[1:])
 	case "clean":
 		return cmdClean(args[1:])
 	case "help", "--help", "-h":
@@ -123,19 +126,24 @@ func usage() {
 Usage:
   bojo init                       create a project
   bojo deps list                  show dependencies
-  bojo deps add <url>#<pkg>@<ver> add a repository dependency
+  bojo deps add <url>@<ver>       add a repository dependency
   bojo deps add-python <name>[@<ver>]
                                   add a Python package
   bojo update                     resolve and write bojo.lock
   bojo build [--locked]           build into .out/
-  bojo run <url>#<pkg>@<ver>      ephemeral build and run a remote command
-  bojo install <url>#<pkg>@<ver>  ephemeral build, binary to ~/.bojo/bin
+  bojo run <url>@<ver>            ephemeral build and run a remote command
+  bojo install <url>@<ver>        ephemeral build, binary to ~/.bojo/bin
   bojo tree                       print the resolved graph
   bojo why <pkg>                  explain where a package comes from
   bojo allow <id>|--list          approve or list hooks
   bojo verify                     verify the lock against fresh checkouts
+  bojo lib verify                 verify a library (manifest, purity, probe, tests, outdated, API)
+  bojo lib api [--stdout]         generate API.md from mojo doc JSON
+  bojo lib pages [--out <dir>]    generate static HTML docs for GitHub Pages
+  bojo docs <pkg> [path|api]      render package docs or API.md in the terminal
   bojo doctor                     check toolchain, compiler and PATH
-  bojo toolchain install <ver>    install a Mojo toolchain into ~/.bojo/mojo
+  bojo toolchain install <mojo|python> <ver>
+                                  install a toolchain into ~/.bojo
   bojo toolchain list             list installed toolchains
   bojo cache list|clear           inspect or clear .bojo/cache
   bojo clean [--all]              remove .bojo/ (--all: also .out/ and .vendor/)
@@ -294,7 +302,9 @@ func cmdInit(args []string) int {
 		name = args[0]
 	}
 
-	cfg := fmt.Sprintf(`[project]
+	cfg := fmt.Sprintf(`schema = 1
+
+[project]
 name    = %q
 version = "0.1.0"
 entry   = "main.mojo"
@@ -428,15 +438,38 @@ func cmdCache(args []string) int {
 	}
 	switch args[0] {
 	case "list":
-		entries, err := os.ReadDir(filepath.Join(cacheDir, "src"))
-		if err != nil {
+		srcDir := filepath.Join(cacheDir, "mojo", "src")
+		if _, err := os.Stat(srcDir); err != nil {
 			fmt.Println("cache is empty")
 			return exitOK
 		}
-		for _, e := range entries {
-			fmt.Printf("  %s\n", e.Name())
+		var repos []string
+		_ = filepath.WalkDir(srcDir, func(p string, d os.DirEntry, err error) error {
+			if err != nil || !d.IsDir() || p == srcDir {
+				return nil
+			}
+			if strings.Contains(d.Name(), "@") {
+				if rel, rerr := filepath.Rel(srcDir, p); rerr == nil {
+					repos = append(repos, filepath.ToSlash(rel))
+				}
+				return filepath.SkipDir
+			}
+			return nil
+		})
+		if len(repos) == 0 {
+			entries, err := os.ReadDir(srcDir)
+			if err != nil || len(entries) == 0 {
+				fmt.Println("cache is empty")
+				return exitOK
+			}
+			for _, e := range entries {
+				repos = append(repos, e.Name())
+			}
 		}
-		fmt.Printf("%d repository/ies cached\n", len(entries))
+		for _, r := range repos {
+			fmt.Printf("  %s\n", r)
+		}
+		fmt.Printf("%d repository/ies cached\n", len(repos))
 		return exitOK
 	case "clear":
 		if ok, err := removeIfExists(cacheDir); err != nil {
@@ -488,29 +521,41 @@ func cmdGet(args []string) int {
 		fail(err)
 		return exitUsage
 	}
-	if existing, ok := cfg.DepsFrom[sp.repo]; ok && existing.Version == sp.tag() {
-		fmt.Printf("already declared: %s@%s\n", sp.repo, sp.version)
-		return exitOK
+	wantTag := sp.tag()
+	wantMajor := tag.MajorOf(wantTag)
+	tableKey := sp.repo
+	if existing, ok := cfg.DepsFrom[sp.repo]; ok {
+		if existing.Version == wantTag {
+			fmt.Printf("already declared: %s@%s\n", sp.repo, sp.version)
+			return exitOK
+		}
+		if existingMajor := tag.MajorOf(existing.Version); existingMajor != wantMajor && (wantMajor >= 2 || existingMajor >= 2) {
+			tableKey = fmt.Sprintf("%s@v%d", sp.repo, wantMajor)
+			if existingMajorEntry, ok := cfg.DepsFrom[tableKey]; ok && existingMajorEntry.Version == wantTag {
+				fmt.Printf("already declared: %s@%s\n", sp.repo, sp.version)
+				return exitOK
+			}
+		}
 	}
 
-	if err := appendDepFrom(dir, sp, aliasName); err != nil {
+	if err := appendDepFrom(dir, tableKey, sp, aliasName); err != nil {
 		fail(err)
 		return exitUsage
 	}
 	fmt.Printf("added %s@%s\n", sp.repo, sp.version)
-	printVendoredReadme(dir, sp.repo)
+	printVendoredReadme(dir, sp.repo, wantTag)
 	fmt.Println("next: bojo update")
 	return exitOK
 }
 
 // printVendoredReadme shows what a package does right after it was added, but
 // only when the vendor tree already has it (D77).
-func printVendoredReadme(dir, repo string) {
+func printVendoredReadme(dir, repo, ver string) {
 	norm, err := urlkey.Normalize(repo)
 	if err != nil {
 		return
 	}
-	modPath, err := urlkey.ModulePath(norm)
+	modPath, err := urlkey.VersionedModulePath(norm, tag.MajorOf(ver))
 	if err != nil {
 		return
 	}
@@ -551,6 +596,10 @@ func cmdUpdate(args []string) int {
 	if err != nil {
 		fail(err)
 		return resolveExit(err)
+	}
+	if err := verifyPulledGraph(g); err != nil {
+		fail(err)
+		return exitBuild
 	}
 	if err := writeLock(dir, toolchainFingerprint(), g); err != nil {
 		fail(err)
@@ -611,6 +660,10 @@ func cmdVendor(args []string) int {
 	}
 	if code := gate(dir, allow.Filter(g.LockedCommits()), g); code != exitOK {
 		return code
+	}
+	if err := verifyPulledGraph(g); err != nil {
+		fail(err)
+		return exitBuild
 	}
 	m, err := vendor.Build(dir, g)
 	if err != nil {
@@ -674,6 +727,10 @@ func cmdBuild(args []string) int {
 	if err != nil {
 		fail(err)
 		return resolveExit(err)
+	}
+	if err := verifyPulledGraph(g); err != nil {
+		fail(err)
+		return exitBuild
 	}
 
 	if locked {
@@ -800,8 +857,17 @@ func runVendorHooks(g *resolve.Graph, projectDir string) error {
 		if r.Hook != "vendor" {
 			continue
 		}
-		p, ok := packageByShortName(g, r.Pkg)
-		if !ok {
+		var p *resolve.Package
+		for _, cand := range g.Packages {
+			if cand.Repo == r.Repo && cand.Commit == r.Commit {
+				p = cand
+				break
+			}
+		}
+		if p == nil {
+			p, _ = packageByShortName(g, r.Pkg)
+		}
+		if p == nil {
 			continue
 		}
 		fmt.Printf("hook vendor: %s (%s)\n", strings.Join(r.Command, " "), r.Pkg)
@@ -873,20 +939,29 @@ func cmdWhy(args []string) int {
 	if code != exitOK {
 		return code
 	}
-	p, ok := packageByShortName(g, args[0])
+	p, ok := g.Packages[args[0]]
 	if !ok {
-		p, ok = g.Packages[args[0]]
+		p, ok = packageByShortName(g, args[0])
 	}
 	if !ok {
 		fail(fmt.Errorf("package %q is not part of this build (see `bojo tree`)", args[0]))
 		return exitUsage
 	}
 	fmt.Printf("%s\n", p.Name)
+	fmt.Printf("  path    %s\n", p.Path)
 	fmt.Printf("  repo    %s\n", p.Repo)
+	if p.ReplacedFrom != "" {
+		fmt.Printf("  replaces %s\n", p.ReplacedFrom)
+	}
 	fmt.Printf("  commit  %s\n", p.Commit)
 	fmt.Printf("  dir     %s\n", p.Dir)
 	for _, r := range p.Routes {
 		fmt.Printf("  route   %s\n", r)
+	}
+	for _, chain := range p.RequiredBy {
+		if len(chain) > 0 {
+			fmt.Printf("  via     %s\n", strings.Join(chain, " -> "))
+		}
 	}
 	return exitOK
 }
@@ -975,7 +1050,7 @@ func cmdAllow(args []string) int {
 
 func cmdRun(args []string, install bool) int {
 	if len(args) == 0 {
-		fail(errors.New("usage: bojo run|install <url>@<pkg>/<version>"))
+		fail(errors.New("usage: bojo run|install <url>@<version>"))
 		return exitUsage
 	}
 	spec, err := parseSpec(args[0])
@@ -1001,7 +1076,9 @@ func cmdRun(args []string, install bool) int {
 	}
 	defer os.RemoveAll(tmp)
 
-	cfgText := fmt.Sprintf(`[project]
+	cfgText := fmt.Sprintf(`schema = 1
+
+[project]
 name    = "ephemeral"
 version = "0.0.0"
 entry   = "main.mojo"
@@ -1067,10 +1144,6 @@ version = %q
 		return exitBuild
 	}
 	modulesDir := ""
-	if err != nil {
-		fail(err)
-		return exitBuild
-	}
 	out := filepath.Join(tmp, ".out", name)
 	version := ""
 	if cwdCfg, cerr := manifest.Load(cwd); cerr == nil {
@@ -1182,12 +1255,13 @@ func writeLock(dir, mojoFingerprint string, g *resolve.Graph) error {
 	lf := &lock.File{Version: 1, Mojo: mojoFingerprint}
 	for _, e := range g.Lock {
 		lf.Packages = append(lf.Packages, lock.Entry{
-			Name:   e.Name,
-			Repo:   e.Repo,
-			Tag:    e.Tag,
-			Commit: e.Commit,
-			Tree:   e.Tree,
-			Alias:  e.Alias,
+			Name:         e.Name,
+			Repo:         e.Repo,
+			Tag:          e.Tag,
+			Commit:       e.Commit,
+			Tree:         e.Tree,
+			Alias:        e.Alias,
+			ReplacedFrom: e.ReplacedFrom,
 		})
 	}
 	return lock.Save(dir, lf)
@@ -1260,13 +1334,13 @@ func insertIntoTable(text, header, key, line string) (string, bool, error) {
 	return strings.Join(out, "\n"), true, nil
 }
 
-func appendDepFrom(dir string, sp spec, alias string) error {
+func appendDepFrom(dir, tableKey string, sp spec, alias string) error {
 	path := filepath.Join(dir, "bojo.toml")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	header := fmt.Sprintf("[deps-from.%q]", sp.repo)
+	header := fmt.Sprintf("[deps-from.%q]", tableKey)
 	line := fmt.Sprintf("version = %q", sp.tag())
 	if updated, found, err := insertIntoTable(string(raw), header, "version", line); err != nil {
 		return err
@@ -1286,7 +1360,7 @@ func appendDepFrom(dir string, sp spec, alias string) error {
 		if err != nil {
 			return err
 		}
-		modPath, err := urlkey.ModulePath(norm)
+		modPath, err := urlkey.VersionedModulePath(norm, tag.MajorOf(sp.tag()))
 		if err != nil {
 			return err
 		}

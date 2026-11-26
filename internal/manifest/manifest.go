@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/bojolib/bojo/internal/tag"
+	"github.com/bojolib/bojo/internal/urlkey"
 )
 
 type Project struct {
@@ -45,28 +47,56 @@ type Dep struct {
 	Path string `toml:"path"`
 }
 
-// DepSpec is one dependency: a version and an optional local alias.
+// DepSpec is one dependency: a version or commit, and an optional local alias.
 type DepSpec struct {
 	Version string
+	Commit  string
 	Alias   string
 }
 
-// UnmarshalTOML accepts "v1.2.3" or { version = "v1.2.3", as = "name" }.
+// UnmarshalTOML accepts "v1.2.3" or { version = "v1.2.3", commit = "...", as = "name" }.
 func (d *DepSpec) UnmarshalTOML(v any) error {
 	switch t := v.(type) {
 	case string:
 		d.Version = t
 	case map[string]any:
-		if s, ok := t["version"].(string); ok {
-			d.Version = s
-		}
-		if s, ok := t["as"].(string); ok {
-			d.Alias = s
+		for k, val := range t {
+			s, ok := val.(string)
+			if !ok {
+				return fmt.Errorf("dependency field %q must be a string", k)
+			}
+			switch k {
+			case "version":
+				d.Version = s
+			case "commit":
+				d.Commit = s
+			case "as":
+				d.Alias = s
+			default:
+				return fmt.Errorf("unknown dependency field %q", k)
+			}
 		}
 	default:
 		return fmt.Errorf("a dependency must be a version string or a table")
 	}
 	return nil
+}
+
+// OverrideSpec pins an existing module path to a chosen version or commit
+// across the entire dependency graph. Only allowed in the root bojo.toml.
+type OverrideSpec struct {
+	Version string `toml:"version"`
+	Commit  string `toml:"commit"`
+}
+
+// ReplaceSpec redirects a module path to a fork repository or a local
+// directory while preserving the original import path. Only allowed in the
+// root bojo.toml.
+type ReplaceSpec struct {
+	Repo    string `toml:"repo"`
+	Version string `toml:"version"`
+	Commit  string `toml:"commit"`
+	Path    string `toml:"path"`
 }
 
 // DepsFrom maps a repository URL to its version: repo -> spec. One repository
@@ -130,8 +160,14 @@ type File struct {
 	// Alias maps a module path to a short name the project may import: only the
 	// project may alias, never a library (D68). Keying by path, not by name, is
 	// what makes two repositories with the same name distinguishable.
-	Alias  map[string]string `toml:"alias"`
-	Linker Linker            `toml:"linker"`
+	Alias map[string]string `toml:"alias"`
+	// Override pins a module path to one version/commit across the graph to
+	// resolve diamond conflicts explicitly (root bojo.toml only).
+	Override map[string]OverrideSpec `toml:"override"`
+	// Replace redirects a module path to a fork repository or local directory
+	// while keeping the original import path (root bojo.toml only).
+	Replace map[string]ReplaceSpec `toml:"replace"`
+	Linker  Linker                 `toml:"linker"`
 }
 
 // Load reads bojo.toml from dir and validates it.
@@ -161,46 +197,132 @@ func Load(dir string) (*File, error) {
 		return nil, fmt.Errorf("%s: unknown keys: %v", path, unknown)
 	}
 
+	if err := f.Validate(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return &f, nil
+}
+
+// Validate checks every field and table of a consumer bojo.toml.
+func (f *File) Validate() error {
 	if f.Schema != 0 && f.Schema != 1 {
-		return nil, fmt.Errorf("%s: unsupported schema %d (this bojo reads schema 1)", path, f.Schema)
+		return fmt.Errorf("unsupported schema %d (this bojo reads schema 1)", f.Schema)
 	}
 	if f.Project.Name == "" {
-		return nil, fmt.Errorf("%s: [project] name is required", path)
+		return fmt.Errorf("[project] name is required")
 	}
 	if f.Project.Entry == "" {
-		return nil, fmt.Errorf("%s: [project] entry is required", path)
+		return fmt.Errorf("[project] entry is required")
 	}
 	switch f.Build.Output {
 	case "", "dir", "onefile":
 	default:
-		return nil, fmt.Errorf("%s: [build] output must be \"dir\" or \"onefile\", got %q", path, f.Build.Output)
+		return fmt.Errorf("[build] output must be \"dir\" or \"onefile\", got %q", f.Build.Output)
 	}
 	if len(f.Deps.Python) > 0 && f.Version.Python == "" {
-		return nil, fmt.Errorf("%s: deps.python needs [version] python", path)
+		return fmt.Errorf("deps.python needs [version] python")
 	}
 	for name, d := range f.Deps.Local {
 		if d.Path == "" {
-			return nil, fmt.Errorf("%s: deps.%s needs a path", path, name)
+			return fmt.Errorf("deps.%s needs a path", name)
 		}
 	}
 
-	for repo, spec := range f.DepsFrom {
-		if strings.TrimSpace(repo) == "" {
-			return nil, fmt.Errorf("%s: a deps-from entry needs a repository", path)
+	for rawKey, spec := range f.DepsFrom {
+		if strings.TrimSpace(rawKey) == "" {
+			return fmt.Errorf("a deps-from entry needs a repository")
 		}
-		if n := len(spec.Alias); spec.Alias != "" && (strings.ContainsAny(spec.Alias, " \t/.\\:") || n == 0) {
-			return nil, fmt.Errorf("%s: alias %q for %s is not a plain name", path, spec.Alias, repo)
+		repoRaw, majorHint := urlkey.SplitDepKey(rawKey)
+		if _, err := urlkey.Normalize(repoRaw); err != nil {
+			return fmt.Errorf("deps-from.%q: %w", rawKey, err)
+		}
+		if spec.Version != "" && spec.Commit != "" {
+			return fmt.Errorf("deps-from.%q: set version or commit, not both", rawKey)
+		}
+		if majorHint > 0 && spec.Version != "" {
+			if v, err := tag.ParseVersion(spec.Version); err == nil && v.Major != majorHint {
+				return fmt.Errorf("deps-from.%q: key major v%d disagrees with version %q", rawKey, majorHint, spec.Version)
+			}
+		}
+		if spec.Alias != "" && strings.ContainsAny(spec.Alias, " \t/.\\:") {
+			return fmt.Errorf("alias %q for %s is not a plain name", spec.Alias, rawKey)
 		}
 	}
 
 	for modulePath, alias := range f.Alias {
-		if strings.TrimSpace(modulePath) == "" {
-			return nil, fmt.Errorf("%s: an [alias] entry needs a module path", path)
+		if err := validateModulePathKey("alias", modulePath); err != nil {
+			return err
 		}
 		if alias == "" || strings.ContainsAny(alias, " \t/.\\:") {
-			return nil, fmt.Errorf("%s: alias %q is not a plain name", path, alias)
+			return fmt.Errorf("alias %q is not a plain name", alias)
 		}
 	}
 
-	return &f, nil
+	for modPath, spec := range f.Override {
+		if err := validateModulePathKey("override", modPath); err != nil {
+			return err
+		}
+		if spec.Version == "" && spec.Commit == "" {
+			return fmt.Errorf("override.%q needs version or commit", modPath)
+		}
+		if spec.Version != "" && spec.Commit != "" {
+			return fmt.Errorf("override.%q cannot set both version and commit", modPath)
+		}
+		if spec.Version != "" {
+			modMajor, _ := urlkey.ParseModulePath(modPath)
+			if v, err := tag.ParseVersion(spec.Version); err == nil {
+				if modMajor >= 2 && v.Major != modMajor {
+					return fmt.Errorf("override.%q: version %q does not match major v%d", modPath, spec.Version, modMajor)
+				}
+				if modMajor == 0 && v.Major >= 2 {
+					return fmt.Errorf("override.%q: version %q requires major path prefix v%d.%s", modPath, spec.Version, v.Major, modPath)
+				}
+			}
+		}
+	}
+
+	for modPath, spec := range f.Replace {
+		if err := validateModulePathKey("replace", modPath); err != nil {
+			return err
+		}
+		if _, dup := f.Override[modPath]; dup {
+			return fmt.Errorf("%q cannot appear in both [override] and [replace]", modPath)
+		}
+		hasPath := strings.TrimSpace(spec.Path) != ""
+		hasRepo := strings.TrimSpace(spec.Repo) != ""
+		if !hasPath && !hasRepo {
+			return fmt.Errorf("replace.%q needs repo or path", modPath)
+		}
+		if hasPath && hasRepo {
+			return fmt.Errorf("replace.%q cannot set both repo and path", modPath)
+		}
+		if hasPath {
+			if spec.Version != "" || spec.Commit != "" {
+				return fmt.Errorf("replace.%q with local path cannot set version or commit", modPath)
+			}
+			continue
+		}
+		if _, err := urlkey.Normalize(spec.Repo); err != nil {
+			return fmt.Errorf("replace.%q: %w", modPath, err)
+		}
+		if spec.Version == "" && spec.Commit == "" {
+			return fmt.Errorf("replace.%q with repo needs version or commit", modPath)
+		}
+		if spec.Version != "" && spec.Commit != "" {
+			return fmt.Errorf("replace.%q cannot set both version and commit", modPath)
+		}
+	}
+
+	return nil
+}
+
+func validateModulePathKey(section, modPath string) error {
+	s := strings.TrimSpace(modPath)
+	if s == "" || s != modPath {
+		return fmt.Errorf("a [%s] entry needs a module path", section)
+	}
+	if strings.ContainsAny(s, " \t/\\:") || !strings.Contains(s, ".") {
+		return fmt.Errorf("[%s] key %q is not a valid module path (example: gh.bojolib.io)", section, modPath)
+	}
+	return nil
 }

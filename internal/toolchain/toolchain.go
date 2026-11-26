@@ -59,6 +59,18 @@ func Resolve(version string) (string, error) {
 		if p, err := exec.LookPath("mojo"); err == nil {
 			return p, nil
 		}
+		if installed, err := List(); err == nil && len(installed) > 0 {
+			// Fall back to the highest installed toolchain in ~/.bojo/mojo/.
+			best := installed[len(installed)-1]
+			for _, v := range installed {
+				if v > best {
+					best = v
+				}
+			}
+			if p, ok := Installed(best); ok {
+				return p, nil
+			}
+		}
 		return "", fmt.Errorf("no toolchain selected and no mojo on PATH (try `bojo toolchain install 1.2.0`)")
 	}
 	if p, ok := Installed(version); ok {

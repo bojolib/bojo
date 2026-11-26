@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -178,8 +179,72 @@ func ModulePath(normalized string) (string, error) {
 	return strings.Join(parts, "."), nil
 }
 
+// VersionedModulePath returns the collision-free import path for a repository
+// at a given major version: `<host>.<owner>.<repo>` for v0/v1, and
+// `v<N>.<host>.<owner>.<repo>` for major >= 2.
+func VersionedModulePath(normalized string, major int) (string, error) {
+	base, err := ModulePath(normalized)
+	if err != nil {
+		return "", err
+	}
+	if major >= 2 {
+		return fmt.Sprintf("v%d.%s", major, base), nil
+	}
+	return base, nil
+}
+
+// ParseModulePath splits an optional `v<N>.` major-version prefix (N >= 2)
+// from a module path. Paths without a v2+ prefix return (0, modPath).
+func ParseModulePath(modPath string) (major int, base string) {
+	dot := strings.IndexByte(modPath, '.')
+	if dot <= 1 || dot == len(modPath)-1 || modPath[0] != 'v' {
+		return 0, modPath
+	}
+	digits := modPath[1:dot]
+	if digits[0] == '0' {
+		return 0, modPath
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil || n < 2 {
+		return 0, modPath
+	}
+	return n, modPath[dot+1:]
+}
+
+// SplitDepKey splits an optional `@v<N>` major-series suffix from a deps-from
+// table key, allowing v1 and v2 of the same repository to coexist in TOML:
+//
+//	[deps-from."https://github.com/bojolib/socket"]
+//	version = "v1.4.0"
+//
+//	[deps-from."https://github.com/bojolib/socket@v2"]
+//	version = "v2.0.0"
+//
+// A plain URL without a `@v<N>` suffix returns (key, 0).
+func SplitDepKey(key string) (repo string, major int) {
+	at := strings.LastIndexByte(key, '@')
+	if at <= 0 {
+		return key, 0
+	}
+	suffix := key[at+1:]
+	if len(suffix) < 2 || suffix[0] != 'v' {
+		return key, 0
+	}
+	digits := suffix[1:]
+	for i := 0; i < len(digits); i++ {
+		if digits[i] < '0' || digits[i] > '9' {
+			return key, 0
+		}
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil {
+		return key, 0
+	}
+	return key[:at], n
+}
+
 // Path turns a normalised URL into a filesystem path without scheme, i.e.
-// https://github.com/LukasLow/mojolib -> github.com/LukasLow/mojolib (D63).
+// https://github.com/bojolib/socket -> github.com/bojolib/socket (D63).
 func Path(normalized string) (string, error) {
 	u, err := url.Parse(normalized)
 	if err != nil {

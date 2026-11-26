@@ -14,12 +14,13 @@ const FileName = "bojo.lock"
 
 // Entry is one pinned package.
 type Entry struct {
-	Name   string `toml:"name"`
-	Repo   string `toml:"repo"`
-	Tag    string `toml:"tag"`
-	Commit string `toml:"commit"`
-	Tree   string `toml:"tree"`
-	Alias  string `toml:"alias,omitempty"`
+	Name         string `toml:"name"`
+	Repo         string `toml:"repo"`
+	Tag          string `toml:"tag"`
+	Commit       string `toml:"commit"`
+	Tree         string `toml:"tree"`
+	Alias        string `toml:"alias,omitempty"`
+	ReplacedFrom string `toml:"replaced_from,omitempty"`
 }
 
 // PythonPackage pins one wheel: version and the hash that was installed.

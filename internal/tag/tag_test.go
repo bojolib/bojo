@@ -93,3 +93,62 @@ func TestMatch(t *testing.T) {
 		t.Fatal("a branch ref must be rejected")
 	}
 }
+
+func TestMajorOf(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"v0.1.0", 0},
+		{"v1.0.0", 1},
+		{"v1.12.4", 1},
+		{"v2.0.0", 2},
+		{"v2.3.4-rc.1", 2},
+		{"v10.0.0", 10},
+		{"", 0},
+		{"latest", 0},
+		{"2.0.0", 0},
+		{"pkg/v2.0.0", 0},
+		{"v2.0", 0},
+		{"abcdef1234", 0},
+	}
+	for _, tc := range cases {
+		if got := MajorOf(tc.in); got != tc.want {
+			t.Errorf("MajorOf(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestLatestInMajor(t *testing.T) {
+	tags := []string{
+		"pkg/v2.9.9",
+		"v0.1.0",
+		"v0.2.0",
+		"v1.0.0",
+		"v1.12.4",
+		"v1.2.0",
+		"v2.0.0-rc.1",
+		"v2.0.0",
+		"v2.1.3",
+		"v2.1.10",
+		"v3.0.0-alpha.1",
+	}
+
+	cases := []struct {
+		major  int
+		want   string
+		wantOK bool
+	}{
+		{0, "v0.2.0", true},
+		{1, "v1.12.4", true},
+		{2, "v2.1.10", true},
+		{3, "v3.0.0-alpha.1", true},
+		{4, "", false},
+	}
+	for _, tc := range cases {
+		got, ok := LatestInMajor(tags, tc.major)
+		if ok != tc.wantOK || got != tc.want {
+			t.Errorf("LatestInMajor(major=%d) = (%q, %v), want (%q, %v)", tc.major, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}

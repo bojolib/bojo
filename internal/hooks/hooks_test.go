@@ -88,12 +88,45 @@ func TestBlockedAndStale(t *testing.T) {
 		t.Fatal("an approved hook must pass the gate")
 	}
 
-	stale := s.Stale(map[string]string{"r": "different"})
+	stale := s.Stale(map[string]bool{"r@different": true})
 	if len(stale) != 1 {
 		t.Fatal("an entry whose commit is not in the lock must be stale")
 	}
-	if len(s.Stale(map[string]string{"r": "abc"})) != 0 {
+	if len(s.Stale(map[string]bool{"r@abc": true})) != 0 {
 		t.Fatal("an entry matching the lock must not be stale")
+	}
+}
+
+func TestCoexistingMajorsFilterAndStale(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Load(dir)
+
+	v1 := Entry{Repo: "https://github.com/bojolib/socket", Commit: "1111111", Pkg: "socket", Hook: "vendor", Command: []string{"cc"}}
+	v2 := Entry{Repo: "https://github.com/bojolib/socket", Commit: "2222222", Pkg: "socket", Hook: "vendor", Command: []string{"cc"}}
+	old := Entry{Repo: "https://github.com/bojolib/socket", Commit: "0000000", Pkg: "socket", Hook: "vendor", Command: []string{"cc"}}
+	for _, e := range []Entry{v1, v2, old} {
+		if err := s.Append(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	locked := map[string]bool{
+		"https://github.com/bojolib/socket@1111111": true,
+		"https://github.com/bojolib/socket@2222222": true,
+	}
+	filtered := s.Filter(locked)
+	if len(filtered.Entries) != 2 {
+		t.Fatalf("filtered len = %d, want 2", len(filtered.Entries))
+	}
+	if !filtered.Allows(v1.Repo, v1.Commit, v1.Pkg, v1.Hook, v1.Command) {
+		t.Error("v1 hook must remain approved")
+	}
+	if !filtered.Allows(v2.Repo, v2.Commit, v2.Pkg, v2.Hook, v2.Command) {
+		t.Error("v2 hook must remain approved")
+	}
+	stale := s.Stale(locked)
+	if len(stale) != 1 || stale[0].Commit != "0000000" {
+		t.Fatalf("stale = %+v, want only old commit 0000000", stale)
 	}
 }
 
